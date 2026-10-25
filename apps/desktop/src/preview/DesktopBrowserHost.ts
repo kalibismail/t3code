@@ -49,7 +49,10 @@ interface AttachedTab {
   focusEmulated: boolean;
   focusChange: Promise<void> | null;
   focusUses: number;
-  readonly focusPending: Set<object>;
+  /** Each pending command, by the relay session waiting on it. */
+  readonly focusPending: Map<object, string | undefined>;
+  /** Used by the agent during its thread's current turn. */
+  turnHeld: boolean;
   focusReleasing: boolean;
   screencasting: boolean;
   readonly onMessage: (
@@ -89,6 +92,8 @@ export const make = Effect.gen(function* () {
   }>(16);
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const tabs = new Map<string, AttachedTab>();
+  /** Threads whose agent turn runs, by the server's account. */
+  const agentTurns = new Set<string>();
   const emit = (event: DesktopBrowserEventType) => runFork(PubSub.publish(outbox, event));
 
   const nextScreenshot = (tab: AttachedTab) => {
@@ -159,16 +164,18 @@ export const make = Effect.gen(function* () {
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
         // The last pending command to settle starts another idle wait.
-        if (tab.focusPending.size > 0 || tab.screencasting) return;
+        if (tab.focusPending.size > 0 || tab.screencasting || tab.turnHeld) return;
         if (tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
       }),
     );
   };
 
   /** A command may wait on the page's next frame, so the guest stays focused until it settles. */
-  const holdFocus = <A>(tab: AttachedTab, work: () => Promise<A>) => {
+  const holdFocus = <A>(tab: AttachedTab, owner: string | undefined, work: () => Promise<A>) => {
     const pending = {};
-    tab.focusPending.add(pending);
+    tab.focusPending.set(pending, owner);
+    // The agent pauses to think between steps; its tab stays focused until the turn ends.
+    if (agentTurns.has(tab.key.threadId)) tab.turnHeld = true;
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
@@ -192,7 +199,29 @@ export const make = Effect.gen(function* () {
   const dropRelay = (tab: AttachedTab) => {
     tab.relay = null;
     tab.screencasting = false;
+    tab.turnHeld = false;
     dropFocusHolds(tab);
+  };
+
+  /** A detached session, such as a closed viewer, waits on nothing it sent. */
+  const dropSessionHolds = (tab: AttachedTab, owner: string) => {
+    for (const [pending, sender] of tab.focusPending) {
+      if (sender === owner) tab.focusPending.delete(pending);
+    }
+    releaseFocusWhenIdle(tab);
+  };
+
+  /**
+   * A command the server stopped waiting on, such as a timed-out screenshot of a hidden
+   * guest, may never settle; the end of the turn that sent it ends its hold too.
+   */
+  const endAgentTurn = (threadId: string) => {
+    agentTurns.delete(threadId);
+    for (const tab of tabs.values()) {
+      if (tab.key.threadId !== threadId) continue;
+      tab.turnHeld = false;
+      dropFocusHolds(tab);
+    }
   };
 
   const relayFor = (tab: AttachedTab) => {
@@ -204,7 +233,7 @@ export const make = Effect.gen(function* () {
         : debuggee.sendCommand(method, params, sessionId);
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
-        send: (method, params, sessionId) => {
+        send: (method, params, sessionId, owner) => {
           if (method === "Page.startScreencast") tab.screencasting = true;
           else if (method === "Page.stopScreencast") tab.screencasting = false;
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
@@ -215,9 +244,10 @@ export const make = Effect.gen(function* () {
           };
           // A screenshot holds focus only once its turn starts, not while queued behind another.
           return method === "Page.captureScreenshot"
-            ? takeScreenshot(tab, relay, () => holdFocus(tab, forward))
-            : holdFocus(tab, forward);
+            ? takeScreenshot(tab, relay, () => holdFocus(tab, owner, forward))
+            : holdFocus(tab, owner, forward);
         },
+        sessionDetached: (owner) => dropSessionHolds(tab, owner),
         targetId: () =>
           debuggee
             .sendCommand("Target.getTargetInfo")
@@ -277,7 +307,8 @@ export const make = Effect.gen(function* () {
       focusEmulated: false,
       focusChange: null,
       focusUses: 0,
-      focusPending: new Set(),
+      focusPending: new Map(),
+      turnHeld: false,
       focusReleasing: false,
       screencasting: false,
       onMessage: (_event, method, params, sessionId) => {
@@ -304,6 +335,11 @@ export const make = Effect.gen(function* () {
     Effect.sync(() => {
       const command = decodeCommand(line);
       if (Option.isNone(command)) return;
+      if (command.value.type === "turn") {
+        if (command.value.active) agentTurns.add(command.value.threadId);
+        else endAgentTurn(command.value.threadId);
+        return;
+      }
       const tab = tabs.get(keyOf(command.value));
       if (!tab) return;
       if (command.value.type === "pointer") {
@@ -324,16 +360,18 @@ export const make = Effect.gen(function* () {
     return tab !== undefined && performance.now() - tab.agentInputAt > AGENT_DOWNLOAD_WINDOW_MS;
   };
 
-  const announceAll = Effect.suspend(() =>
-    Effect.forEach(
+  const announceAll = Effect.suspend(() => {
+    // A new backend: the old one's turns ended without telling us.
+    agentTurns.clear();
+    return Effect.forEach(
       [...tabs.values()],
       (tab) => {
         dropRelay(tab);
         return PubSub.publish(outbox, { type: "attached", ...tab.key });
       },
       { discard: true },
-    ),
-  );
+    );
+  });
 
   return DesktopBrowserHost.of({
     pointers: Stream.fromPubSub(pointers),

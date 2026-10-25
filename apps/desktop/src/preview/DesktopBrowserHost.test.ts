@@ -282,6 +282,82 @@ describe("DesktopBrowserHost", () => {
     }),
   );
 
+  it.effect("keeps a guest the agent used focused through its turn's pauses", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      yield* turn(true);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([]);
+
+      yield* command(host, 1, "Input.dispatchKeyEvent");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
+      // The model thinks between steps; a focus-sensitive menu must not blur meanwhile.
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* turn(false);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }),
+  );
+
+  it.effect(
+    "ends a command's hold with the turn that sent it, even if Chromium never answers",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        yield* host.handleCommandLine(
+          encodeJson({ type: "turn", threadId: key.threadId, active: true }),
+        );
+
+        // A screenshot of a hidden guest the server already gave up on.
+        yield* command(host, 1, "Page.captureScreenshot");
+        yield* settle;
+        expect(debuggee.sent).toEqual([1]);
+        yield* host.handleCommandLine(
+          encodeJson({ type: "turn", threadId: key.threadId, active: false }),
+        );
+        yield* TestClock.adjust("1 minute");
+        expect(debuggee.focusEmulation).toEqual([true, false]);
+      }),
+  );
+
+  it.effect("lets a guest throttle once the session waiting on its command detaches", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      // A viewer's own CDP session, closed while its still of a hidden guest is pending.
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* raw({ id: 2, method: "Page.captureScreenshot", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* raw({
+        id: 3,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-1" },
+      });
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("keeps a streamed guest focused until its screencast ends", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;

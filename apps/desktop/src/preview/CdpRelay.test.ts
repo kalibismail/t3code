@@ -65,8 +65,14 @@ describe("CDP relay", () => {
     ]);
     pending[0]!();
     await settle();
-    expect(send).toHaveBeenNthCalledWith(1, "Page.captureScreenshot", {}, undefined);
-    expect(send).toHaveBeenNthCalledWith(2, "DOM.enable", {}, "iframe-session");
+    expect(send).toHaveBeenNthCalledWith(
+      1,
+      "Page.captureScreenshot",
+      {},
+      undefined,
+      "t3-preview-page",
+    );
+    expect(send).toHaveBeenNthCalledWith(2, "DOM.enable", {}, "iframe-session", "iframe-session");
     expect(written.at(-1)).toEqual({
       id: 5,
       result: { method: "Page.captureScreenshot" },
@@ -92,7 +98,9 @@ describe("CDP relay", () => {
       }),
     );
     await settle();
-    expect(send.mock.calls).toEqual([["Runtime.runIfWaitingForDebugger", {}, "iframe-session"]]);
+    expect(send.mock.calls).toEqual([
+      ["Runtime.runIfWaitingForDebugger", {}, "iframe-session", "iframe-session"],
+    ]);
   });
 
   // Playwright enables focus emulation on every page it connects to, and Chromium then
@@ -172,7 +180,7 @@ describe("CDP relay extra sessions", () => {
     expect(written.find((m) => m["id"] === 4)).toHaveProperty("error");
     relay.receive(JSON.stringify({ id: 5, method: "Page.startScreencast", sessionId: extra }));
     await settle();
-    expect(send).toHaveBeenLastCalledWith("Page.startScreencast", {}, undefined);
+    expect(send).toHaveBeenLastCalledWith("Page.startScreencast", {}, undefined, extra);
     written.length = 0;
     relay.event("Page.screencastFrame", { data: "x" }, undefined);
     expect(written.map((m) => m["sessionId"])).toEqual(["t3-preview-page", extra]);

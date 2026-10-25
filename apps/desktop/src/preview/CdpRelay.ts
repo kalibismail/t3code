@@ -5,7 +5,10 @@ export interface CdpRelayTarget {
     method: string,
     params: Record<string, unknown>,
     sessionId: string | undefined,
+    /** The relay session that sent it; a detached one waits on nothing it sent. */
+    owner?: string,
   ) => Promise<unknown>;
+  readonly sessionDetached?: (owner: string) => void;
   /** The page's own CDP target id; Playwright keys the main frame by it. */
   readonly targetId: () => Promise<string>;
   readonly url: () => string;
@@ -111,8 +114,10 @@ export function createCdpRelayConnection(
       }
       case "Target.detachFromTarget": {
         const sessionId = command.params?.["sessionId"];
-        if (typeof sessionId === "string" && sessionId !== PAGE_SESSION_ID)
+        if (typeof sessionId === "string" && sessionId !== PAGE_SESSION_ID) {
           sessions.delete(sessionId);
+          target.sessionDetached?.(sessionId);
+        }
         return {};
       }
       case "Target.setAutoAttach": {
@@ -139,7 +144,7 @@ export function createCdpRelayConnection(
     }
     // Playwright asks for this on every page; the host emulates focus only while it is in use.
     if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
-    return target.send(command.method, command.params ?? {}, child);
+    return target.send(command.method, command.params ?? {}, child, command.sessionId);
   };
 
   return {
