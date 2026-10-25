@@ -108,6 +108,18 @@ const watchReplies = (host: DesktopBrowserHost.DesktopBrowserHost["Service"]) =>
     return replies;
   });
 
+/** Whether the client should paint the guest, each time that changes. */
+const watchPainting = (host: DesktopBrowserHost.DesktopBrowserHost["Service"]) =>
+  Effect.gen(function* () {
+    const painting: Array<boolean> = [];
+    yield* host.painting.pipe(
+      Stream.runForEach(({ active }) => Effect.sync(() => painting.push(active))),
+      Effect.forkScoped,
+    );
+    yield* Effect.yieldNow;
+    return painting;
+  });
+
 describe("DesktopBrowserHost", () => {
   it.effect("announces tabs already attached to a backend that starts later", () =>
     Effect.gen(function* () {
@@ -522,6 +534,106 @@ describe("DesktopBrowserHost", () => {
       });
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("paints a hidden guest only while the screenshot it is taking is pending", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const painting = yield* watchPainting(host);
+
+      yield* command(host, 1, "DOM.enable");
+      yield* settle;
+      expect(painting).toEqual([]);
+
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* command(host, 3, "Page.captureScreenshot");
+      yield* settle;
+      expect(painting).toEqual([true]);
+
+      // The first answers once the guest paints; the queued one then takes its turn.
+      debuggee.release();
+      yield* settle;
+      expect(debuggee.sent).toEqual([1, 2, 3]);
+      debuggee.release();
+      yield* settle;
+      expect(painting).toEqual([true, false, true, false]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("stops painting for a screenshot Chromium never answers", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const painting = yield* watchPainting(host);
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      // The server gave up on it, and the agent's turn ends.
+      yield* turn(true);
+      yield* command(host, 1, "Page.captureScreenshot");
+      yield* settle;
+      yield* turn(false);
+      yield* settle;
+      expect(painting).toEqual([true, false]);
+
+      // The page loads a new document, which also frees the screenshot turn.
+      debuggee.navigate();
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
+      debuggee.navigate();
+      yield* settle;
+      expect(painting).toEqual([true, false, true, false]);
+
+      // The server releases the relay.
+      yield* command(host, 3, "Page.captureScreenshot");
+      yield* settle;
+      yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+      yield* settle;
+      expect(painting).toEqual([true, false, true, false, true, false]);
+
+      // The guest detaches; a replacement starts with no screenshot pending.
+      const replacement = makeDebuggee();
+      host.attach(key, replacement.tab);
+      yield* command(host, 4, "Page.captureScreenshot");
+      yield* settle;
+      host.detach(key);
+      yield* settle;
+      expect(painting).toEqual([true, false, true, false, true, false, true, false]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("paints a streamed guest until its last screencast ends", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const painting = yield* watchPainting(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      yield* raw({ id: 2, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect([yield* Queue.take(replies), yield* Queue.take(replies)]).toEqual([1, 2]);
+      yield* raw({ id: 3, method: "Page.startScreencast", sessionId: "t3-preview-page-1" });
+      yield* raw({ id: 4, method: "Page.startScreencast", sessionId: "t3-preview-page-2" });
+      yield* raw({ id: 5, method: "Page.stopScreencast", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      debuggee.release();
+      yield* settle;
+      expect(painting).toEqual([true]);
+
+      yield* raw({
+        id: 6,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-2" },
+      });
+      yield* settle;
+      expect(painting).toEqual([true, false]);
     }).pipe(Effect.scoped),
   );
 

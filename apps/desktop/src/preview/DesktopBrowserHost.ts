@@ -52,7 +52,12 @@ interface AttachedTab {
   focusChange: Promise<void> | null;
   focusUses: number;
   /** Each pending command, by the extra session waiting on it; the main connection's have none. */
-  readonly focusPending: Map<object, string | undefined>;
+  readonly focusPending: Map<
+    object,
+    { readonly owner: string | undefined; readonly paints: boolean }
+  >;
+  /** Whether the client keeps the guest painting, as published on `painting`. */
+  painting: boolean;
   /**
    * Driven by the agent since its thread's last turn ended or the guest last throttled. A
    * turn's start can reach us after its first command, so this holds focus once it does.
@@ -85,6 +90,11 @@ export class DesktopBrowserHost extends Context.Service<
       readonly x: number;
       readonly y: number;
     }>;
+    /** Whether a guest needs its frames painted while the panel hides it. */
+    readonly painting: Stream.Stream<{
+      readonly key: DesktopBrowserTabKey;
+      readonly active: boolean;
+    }>;
   }
 >()("@t3tools/desktop/preview/DesktopBrowserHost") {}
 
@@ -96,6 +106,10 @@ export const make = Effect.gen(function* () {
     readonly x: number;
     readonly y: number;
   }>(16);
+  const painting = yield* PubSub.unbounded<{
+    readonly key: DesktopBrowserTabKey;
+    readonly active: boolean;
+  }>();
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const tabs = new Map<string, AttachedTab>();
   /** Threads whose agent turn runs, by the server's account. */
@@ -180,6 +194,20 @@ export const make = Effect.gen(function* () {
     );
   };
 
+  /**
+   * Electron composites no offscreen guest, so its screenshot or screencast waits for a frame
+   * that never comes. The client paints the guest behind the app while one is pending; the
+   * capture then finishes on its own, and the guest goes back offscreen once none is.
+   */
+  const syncPainting = (tab: AttachedTab) => {
+    const active =
+      tabs.get(keyOf(tab.key)) === tab &&
+      (tab.screencasts.size > 0 || [...tab.focusPending.values()].some((hold) => hold.paints));
+    if (tab.painting === active) return;
+    tab.painting = active;
+    runFork(PubSub.publish(painting, { key: tab.key, active }));
+  };
+
   /** A command may wait on the page's next frame, so the guest stays focused until it settles. */
   const holdFocus = <A>(
     tab: AttachedTab,
@@ -188,17 +216,19 @@ export const make = Effect.gen(function* () {
     work: () => Promise<A>,
   ) => {
     const pending = {};
-    tab.focusPending.set(pending, owner);
+    tab.focusPending.set(pending, { owner, paints: method === "Page.captureScreenshot" });
     // Viewers and recordings use extra sessions; only the main connection is the agent's,
     // and Playwright's own housekeeping on it is not the agent using the tab.
     if (owner === undefined && AGENT_INPUT_METHOD.test(method)) tab.agentUsed = true;
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
+    syncPainting(tab);
     return work().finally(() => {
       if (!tab.focusPending.delete(pending)) return;
       tab.focusUses += 1;
       releaseFocusWhenIdle(tab);
+      syncPainting(tab);
     });
   };
 
@@ -210,6 +240,7 @@ export const make = Effect.gen(function* () {
   const dropFocusHolds = (tab: AttachedTab) => {
     tab.focusPending.clear();
     releaseFocusWhenIdle(tab);
+    syncPainting(tab);
   };
 
   const dropRelay = (tab: AttachedTab) => {
@@ -220,10 +251,11 @@ export const make = Effect.gen(function* () {
   };
 
   const dropOwnerHolds = (tab: AttachedTab, owner: string | undefined) => {
-    for (const [pending, sender] of tab.focusPending) {
-      if (sender === owner) tab.focusPending.delete(pending);
+    for (const [pending, hold] of tab.focusPending) {
+      if (hold.owner === owner) tab.focusPending.delete(pending);
     }
     releaseFocusWhenIdle(tab);
+    syncPainting(tab);
   };
 
   /** A detached session, such as a closed viewer, waits on nothing it sent. */
@@ -314,6 +346,7 @@ export const make = Effect.gen(function* () {
     tab.relay = null;
     tab.debuggee.debugger.off("message", tab.onMessage);
     tab.debuggee.webContents.off("did-navigate", tab.onNewDocument);
+    syncPainting(tab);
     emit({ type: "detached", ...key });
   };
 
@@ -334,6 +367,7 @@ export const make = Effect.gen(function* () {
       focusChange: null,
       focusUses: 0,
       focusPending: new Map(),
+      painting: false,
       agentUsed: false,
       focusReleasing: false,
       screencasts: new Set(),
@@ -402,6 +436,7 @@ export const make = Effect.gen(function* () {
 
   return DesktopBrowserHost.of({
     pointers: Stream.fromPubSub(pointers),
+    painting: Stream.fromPubSub(painting),
     // Subscribes before announcing, so no attach falls between the two.
     events: Stream.unwrap(
       Effect.gen(function* () {
