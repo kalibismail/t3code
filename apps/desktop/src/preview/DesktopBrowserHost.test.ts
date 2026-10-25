@@ -6,6 +6,7 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as NodeEvents from "node:events";
 
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
@@ -35,11 +36,17 @@ const makeDebuggee = () => {
   const pending: Array<() => void> = [];
   const sent: Array<unknown> = [];
   const sendWaiters: Array<() => void> = [];
+  const focusEmulation: Array<boolean> = [];
   const debuggee = Object.assign(emitter, {
-    sendCommand: (method: string, params?: { id?: number }) =>
+    sendCommand: (method: string, params?: { id?: number; enabled?: boolean }) =>
       new Promise((resolve) => {
         if (method === "Target.getTargetInfo") {
           resolve({ targetInfo: { targetId: "GUEST" } });
+          return;
+        }
+        if (method === "Emulation.setFocusEmulationEnabled") {
+          focusEmulation.push(params?.enabled === true);
+          resolve({});
           return;
         }
         sent.push(params?.id);
@@ -61,11 +68,16 @@ const makeDebuggee = () => {
     navigate: () => webContents.emit("did-navigate"),
     /** Ids of the commands the debugger received, in order. */
     sent,
+    focusEmulation,
     nextSend: () => new Promise<void>((resolve) => sendWaiters.push(resolve)),
     release: () => pending.splice(0).forEach((resolve) => resolve()),
     releaseFirst: () => pending.shift()?.(),
   };
 };
+
+/** Commands wait behind a focus emulation change; it settles within a macrotask. */
+// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary, not a wait for time
+const settle = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
 
 const takeEvents = (host: DesktopBrowserHost.DesktopBrowserHost["Service"], count: number) =>
   host.events.pipe(
@@ -123,6 +135,7 @@ describe("DesktopBrowserHost", () => {
       yield* command(1, "Page.captureScreenshot");
       yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
       yield* command(2, "DOM.enable");
+      yield* settle;
       debuggee.release();
       const [, reply] = yield* Fiber.join(reader);
 
@@ -141,6 +154,7 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 1, "Page.captureScreenshot");
       yield* command(host, 2, "Page.captureScreenshot");
       yield* command(host, 3, "DOM.enable");
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 3]);
 
       debuggee.releaseFirst();
@@ -159,6 +173,7 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 1, "Page.captureScreenshot");
       yield* command(host, 2, "Page.captureScreenshot");
       yield* command(host, 3, "Page.captureScreenshot");
+      yield* settle;
       debuggee.navigate();
       expect(debuggee.sent).toEqual([1, 2]);
 
@@ -181,6 +196,7 @@ describe("DesktopBrowserHost", () => {
 
       yield* command(host, 1, "Page.captureScreenshot");
       yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
       yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
       yield* command(host, 3, "Page.captureScreenshot");
       expect(debuggee.sent).toEqual([1]);
@@ -189,6 +205,55 @@ describe("DesktopBrowserHost", () => {
       debuggee.release();
       yield* Effect.promise(() => sent);
       expect(debuggee.sent).toEqual([1, 3]);
+    }),
+  );
+
+  it.effect("emulates focus while the server drives a guest, then lets a hidden one throttle", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+
+      yield* command(host, 1, "DOM.enable");
+      yield* settle;
+      expect(debuggee.focusEmulation).toEqual([true]);
+      expect(debuggee.sent).toEqual([1]);
+
+      yield* TestClock.adjust("4 seconds");
+      yield* command(host, 2, "Input.dispatchMouseEvent");
+      yield* TestClock.adjust("4 seconds");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* TestClock.adjust("10 seconds");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+
+      yield* command(host, 3, "Page.captureScreenshot");
+      yield* settle;
+      expect(debuggee.focusEmulation).toEqual([true, false, true]);
+      expect(debuggee.sent).toEqual([1, 2, 3]);
+    }),
+  );
+
+  it.effect("keeps a streamed guest focused until its screencast ends", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+
+      yield* command(host, 1, "Page.startScreencast");
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* command(host, 2, "Page.stopScreencast");
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+
+      // A viewer whose connection went away without stopping its screencast.
+      yield* command(host, 3, "Page.startScreencast");
+      yield* TestClock.adjust("1 minute");
+      yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false, true, false]);
     }),
   );
 

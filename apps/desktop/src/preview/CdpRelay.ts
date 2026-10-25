@@ -137,6 +137,8 @@ export function createCdpRelayConnection(
     if (command.method === "Runtime.runIfWaitingForDebugger" && child === undefined) {
       return Promise.resolve({});
     }
+    // Playwright asks for this on every page; the host emulates focus only while it is in use.
+    if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
     return target.send(command.method, command.params ?? {}, child);
   };
 

@@ -23,6 +23,7 @@ const lineEncoder = new TextEncoder();
 const AGENT_INPUT_COMMAND =
   /"method":"(?:Input\.|Page\.navigate"|Runtime\.(?:evaluate|callFunctionOn)")/;
 const AGENT_DOWNLOAD_WINDOW_MS = 5_000;
+const FOCUS_IDLE = "5 seconds";
 
 export interface DesktopBrowserTabKey {
   readonly threadId: string;
@@ -45,6 +46,11 @@ interface AttachedTab {
   downloadDirectory: string | null;
   pendingDownloadGuid: string | null;
   agentInputAt: number;
+  focusEmulated: boolean;
+  focusChange: Promise<void> | null;
+  focusUses: number;
+  focusReleasing: boolean;
+  screencasting: boolean;
   readonly onMessage: (
     event: Electron.Event,
     method: string,
@@ -119,6 +125,56 @@ export const make = Effect.gen(function* () {
       else tab.waitingScreenshots.push(start);
     });
 
+  /**
+   * Chromium counts a focus-emulated guest as captured, so a guest the panel hides would
+   * never throttle. Without it, a hidden guest paints no frames and focus() fires no focus
+   * events, so the guest is emulated focused while the server drives it or streams it.
+   */
+  const setFocusEmulation = (tab: AttachedTab, enabled: boolean) => {
+    if (tab.focusEmulated === enabled) return;
+    tab.focusEmulated = enabled;
+    // A guest that refuses it, or a debugger already gone, behaves as unfocused.
+    const change: Promise<void> = tab.debuggee.debugger
+      .sendCommand("Emulation.setFocusEmulationEnabled", { enabled })
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        if (tab.focusChange === change) tab.focusChange = null;
+      });
+    tab.focusChange = change;
+  };
+
+  const releaseFocusWhenIdle = (tab: AttachedTab) => {
+    if (tab.focusReleasing) return;
+    tab.focusReleasing = true;
+    runFork(
+      Effect.gen(function* () {
+        let uses: number;
+        do {
+          uses = tab.focusUses;
+          yield* Effect.sleep(FOCUS_IDLE);
+        } while (uses !== tab.focusUses);
+        tab.focusReleasing = false;
+        if (!tab.screencasting && tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
+      }),
+    );
+  };
+
+  const useFocus = (tab: AttachedTab) => {
+    tab.focusUses += 1;
+    setFocusEmulation(tab, true);
+    releaseFocusWhenIdle(tab);
+  };
+
+  /** A released relay's screencast has no viewer left to stop it. */
+  const dropRelay = (tab: AttachedTab) => {
+    tab.relay = null;
+    tab.screencasting = false;
+    releaseFocusWhenIdle(tab);
+  };
+
   const relayFor = (tab: AttachedTab) => {
     if (tab.relay) return tab.relay;
     const { webContents, debugger: debuggee } = tab.debuggee;
@@ -128,10 +184,17 @@ export const make = Effect.gen(function* () {
         : debuggee.sendCommand(method, params, sessionId);
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
-        send: (method, params, sessionId) =>
-          method === "Page.captureScreenshot"
-            ? takeScreenshot(tab, relay, () => send(method, params, sessionId))
-            : send(method, params, sessionId),
+        send: (method, params, sessionId) => {
+          if (method === "Page.startScreencast") tab.screencasting = true;
+          else if (method === "Page.stopScreencast") tab.screencasting = false;
+          useFocus(tab);
+          // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
+          const forward = () =>
+            method === "Page.captureScreenshot"
+              ? takeScreenshot(tab, relay, () => send(method, params, sessionId))
+              : send(method, params, sessionId);
+          return tab.focusChange === null ? forward() : tab.focusChange.then(forward);
+        },
         targetId: () =>
           debuggee
             .sendCommand("Target.getTargetInfo")
@@ -188,6 +251,11 @@ export const make = Effect.gen(function* () {
       downloadDirectory: null,
       pendingDownloadGuid: null,
       agentInputAt: Number.NEGATIVE_INFINITY,
+      focusEmulated: false,
+      focusChange: null,
+      focusUses: 0,
+      focusReleasing: false,
+      screencasting: false,
       onMessage: (_event, method, params, sessionId) => {
         if (method === "Browser.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
@@ -219,7 +287,7 @@ export const make = Effect.gen(function* () {
         return;
       }
       if (command.value.type === "release") {
-        tab.relay = null;
+        dropRelay(tab);
         return;
       }
       if (AGENT_INPUT_COMMAND.test(command.value.message)) tab.agentInputAt = performance.now();
@@ -235,7 +303,7 @@ export const make = Effect.gen(function* () {
     Effect.forEach(
       [...tabs.values()],
       (tab) => {
-        tab.relay = null;
+        dropRelay(tab);
         return PubSub.publish(outbox, { type: "attached", ...tab.key });
       },
       { discard: true },
