@@ -234,6 +234,27 @@ describe("DesktopBrowserHost", () => {
     }),
   );
 
+  it.effect("keeps a guest focused while a command it is running is still pending", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+
+      // An evaluation awaiting the page's next frame, which a throttled guest never paints.
+      yield* command(host, 1, "Runtime.evaluate");
+      yield* settle;
+      expect(debuggee.sent).toEqual([1]);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      debuggee.release();
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("keeps a streamed guest focused until its screencast ends", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;
