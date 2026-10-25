@@ -22,6 +22,8 @@ const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBr
 const lineEncoder = new TextEncoder();
 const AGENT_INPUT_COMMAND =
   /"method":"(?:Input\.|Page\.navigate"|Runtime\.(?:evaluate|callFunctionOn)")/;
+/** The same commands as above, by method, for the main connection's sends. */
+const AGENT_INPUT_METHOD = /^(?:Input\.|Page\.navigate$|Runtime\.(?:evaluate|callFunctionOn)$)/;
 const AGENT_DOWNLOAD_WINDOW_MS = 5_000;
 const FOCUS_IDLE = "5 seconds";
 
@@ -51,8 +53,11 @@ interface AttachedTab {
   focusUses: number;
   /** Each pending command, by the extra session waiting on it; the main connection's have none. */
   readonly focusPending: Map<object, string | undefined>;
-  /** Used by the agent during its thread's current turn. */
-  turnHeld: boolean;
+  /**
+   * Driven by the agent since its thread's last turn ended or the guest last throttled. A
+   * turn's start can reach us after its first command, so this holds focus once it does.
+   */
+  agentUsed: boolean;
   focusReleasing: boolean;
   /** The sessions streaming the guest; one stopping leaves the others' screencasts running. */
   readonly screencasts: Set<string | undefined>;
@@ -111,7 +116,8 @@ export const make = Effect.gen(function* () {
   const takeScreenshot = (
     tab: AttachedTab,
     relay: CdpRelayConnection,
-    capture: () => Promise<unknown>,
+    /** Sends only while `current` holds, which focus emulation may outlast. */
+    capture: (current: () => boolean) => Promise<unknown>,
   ) =>
     new Promise<unknown>((resolve, reject) => {
       const start = () => {
@@ -122,7 +128,7 @@ export const make = Effect.gen(function* () {
         }
         const turn = {};
         tab.screenshotTurn = turn;
-        capture()
+        capture(() => tab.screenshotTurn === turn && tab.relay === relay)
           .finally(() => {
             if (tab.screenshotTurn === turn) nextScreenshot(tab);
           })
@@ -165,19 +171,27 @@ export const make = Effect.gen(function* () {
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
         // The last pending command to settle starts another idle wait.
-        if (tab.focusPending.size > 0 || tab.screencasts.size > 0 || tab.turnHeld) return;
+        if (tab.focusPending.size > 0 || tab.screencasts.size > 0) return;
+        // The agent pauses to think between steps; its tab stays focused until the turn ends.
+        if (tab.agentUsed && agentTurns.has(tab.key.threadId)) return;
+        tab.agentUsed = false;
         if (tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
       }),
     );
   };
 
   /** A command may wait on the page's next frame, so the guest stays focused until it settles. */
-  const holdFocus = <A>(tab: AttachedTab, owner: string | undefined, work: () => Promise<A>) => {
+  const holdFocus = <A>(
+    tab: AttachedTab,
+    method: string,
+    owner: string | undefined,
+    work: () => Promise<A>,
+  ) => {
     const pending = {};
     tab.focusPending.set(pending, owner);
-    // The agent pauses to think between steps; its tab stays focused until the turn ends.
-    // Viewers and recordings use extra sessions; only the main connection is the agent's.
-    if (owner === undefined && agentTurns.has(tab.key.threadId)) tab.turnHeld = true;
+    // Viewers and recordings use extra sessions; only the main connection is the agent's,
+    // and Playwright's own housekeeping on it is not the agent using the tab.
+    if (owner === undefined && AGENT_INPUT_METHOD.test(method)) tab.agentUsed = true;
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
@@ -201,7 +215,7 @@ export const make = Effect.gen(function* () {
   const dropRelay = (tab: AttachedTab) => {
     tab.relay = null;
     tab.screencasts.clear();
-    tab.turnHeld = false;
+    tab.agentUsed = false;
     dropFocusHolds(tab);
   };
 
@@ -226,7 +240,7 @@ export const make = Effect.gen(function* () {
     agentTurns.delete(threadId);
     for (const tab of tabs.values()) {
       if (tab.key.threadId !== threadId) continue;
-      tab.turnHeld = false;
+      tab.agentUsed = false;
       dropOwnerHolds(tab, undefined);
     }
   };
@@ -244,15 +258,20 @@ export const make = Effect.gen(function* () {
           if (method === "Page.startScreencast") tab.screencasts.add(owner);
           else if (method === "Page.stopScreencast") tab.screencasts.delete(owner);
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
-          const forward = () => {
+          const forward = (current?: () => boolean) => {
             const change = tab.focusChange;
-            const run = () => send(method, params, sessionId);
+            const run = () =>
+              current === undefined || current()
+                ? send(method, params, sessionId)
+                : Promise.reject(new Error("The page this screenshot was for has moved on."));
             return change === null ? run() : change.then(run);
           };
           // A screenshot holds focus only once its turn starts, not while queued behind another.
           return method === "Page.captureScreenshot"
-            ? takeScreenshot(tab, relay, () => holdFocus(tab, owner, forward))
-            : holdFocus(tab, owner, forward);
+            ? takeScreenshot(tab, relay, (current) =>
+                holdFocus(tab, method, owner, () => forward(current)),
+              )
+            : holdFocus(tab, method, owner, forward);
         },
         sessionDetached: (owner) => dropSessionHolds(tab, owner),
         targetId: () =>
@@ -315,7 +334,7 @@ export const make = Effect.gen(function* () {
       focusChange: null,
       focusUses: 0,
       focusPending: new Map(),
-      turnHeld: false,
+      agentUsed: false,
       focusReleasing: false,
       screencasts: new Set(),
       onMessage: (_event, method, params, sessionId) => {

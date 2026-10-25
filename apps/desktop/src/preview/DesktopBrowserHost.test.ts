@@ -31,9 +31,10 @@ const command = (
     }),
   );
 
-const makeDebuggee = () => {
+const makeDebuggee = (options: { readonly deferFocus?: boolean } = {}) => {
   const emitter = new NodeEvents.EventEmitter();
   const pending: Array<() => void> = [];
+  const focusChanges: Array<() => void> = [];
   const sent: Array<unknown> = [];
   const sendWaiters: Array<() => void> = [];
   const focusEmulation: Array<boolean> = [];
@@ -46,7 +47,8 @@ const makeDebuggee = () => {
         }
         if (method === "Emulation.setFocusEmulationEnabled") {
           focusEmulation.push(params?.enabled === true);
-          resolve({});
+          if (options.deferFocus) focusChanges.push(() => resolve({}));
+          else resolve({});
           return;
         }
         sent.push(params?.id);
@@ -72,6 +74,7 @@ const makeDebuggee = () => {
     nextSend: () => new Promise<void>((resolve) => sendWaiters.push(resolve)),
     release: () => pending.splice(0).forEach((resolve) => resolve()),
     releaseFirst: () => pending.shift()?.(),
+    settleFocus: () => focusChanges.splice(0).forEach((resolve) => resolve()),
   };
 };
 
@@ -295,6 +298,71 @@ describe("DesktopBrowserHost", () => {
       expect(debuggee.sent).toEqual([1, 2]);
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true]);
+    }),
+  );
+
+  it.effect("never sends a screenshot a navigation superseded while focus was changing", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee({ deferFocus: true });
+      host.attach(key, debuggee.tab);
+
+      yield* command(host, 1, "Page.captureScreenshot");
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
+      debuggee.navigate();
+      debuggee.settleFocus();
+      yield* settle;
+      // Two captures in flight would undo the one-at-a-time guard.
+      expect(debuggee.sent).toEqual([2]);
+    }),
+  );
+
+  it.effect("keeps a guest focused when its turn starts after the agent's first command", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      yield* command(host, 1, "Input.dispatchKeyEvent");
+      yield* settle;
+      yield* turn(true);
+      debuggee.release();
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* turn(false);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }),
+  );
+
+  it.effect("lets a guest throttle through a turn that only sent it housekeeping", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      yield* host.handleCommandLine(
+        encodeJson({ type: "turn", threadId: key.threadId, active: true }),
+      );
+
+      // Playwright re-enabling a domain after a reload is not the agent using the tab.
+      yield* command(host, 1, "Runtime.enable");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+
+      yield* command(host, 2, "Runtime.evaluate");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false, true]);
     }),
   );
 
