@@ -218,9 +218,14 @@ describe("DesktopBrowserHost", () => {
       yield* settle;
       expect(debuggee.focusEmulation).toEqual([true]);
       expect(debuggee.sent).toEqual([1]);
+      debuggee.release();
+      yield* settle;
 
       yield* TestClock.adjust("4 seconds");
       yield* command(host, 2, "Input.dispatchMouseEvent");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
       yield* TestClock.adjust("4 seconds");
       expect(debuggee.focusEmulation).toEqual([true]);
 
@@ -255,6 +260,28 @@ describe("DesktopBrowserHost", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("lets a guest throttle once Chromium can no longer answer its pending command", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+
+      yield* command(host, 1, "Runtime.evaluate");
+      yield* settle;
+      yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+
+      // A command the old document never answers.
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
+      expect(debuggee.sent).toEqual([1, 2]);
+      debuggee.navigate();
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false, true, false]);
+    }),
+  );
+
   it.effect("keeps a streamed guest focused until its screencast ends", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;
@@ -266,11 +293,17 @@ describe("DesktopBrowserHost", () => {
       expect(debuggee.focusEmulation).toEqual([true]);
 
       yield* command(host, 2, "Page.stopScreencast");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true, false]);
 
       // A viewer whose connection went away without stopping its screencast.
       yield* command(host, 3, "Page.startScreencast");
+      yield* settle;
+      debuggee.release();
+      yield* settle;
       yield* TestClock.adjust("1 minute");
       yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
       yield* TestClock.adjust("1 minute");

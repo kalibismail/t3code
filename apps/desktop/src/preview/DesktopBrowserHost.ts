@@ -49,6 +49,7 @@ interface AttachedTab {
   focusEmulated: boolean;
   focusChange: Promise<void> | null;
   focusUses: number;
+  readonly focusPending: Set<object>;
   focusReleasing: boolean;
   screencasting: boolean;
   readonly onMessage: (
@@ -157,22 +158,41 @@ export const make = Effect.gen(function* () {
           yield* Effect.sleep(FOCUS_IDLE);
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
-        if (!tab.screencasting && tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
+        // The last pending command to settle starts another idle wait.
+        if (tab.focusPending.size > 0 || tab.screencasting) return;
+        if (tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
       }),
     );
   };
 
-  const useFocus = (tab: AttachedTab) => {
+  /** A command may wait on the page's next frame, so the guest stays focused until it settles. */
+  const holdFocus = <A>(tab: AttachedTab, work: () => Promise<A>) => {
+    const pending = {};
+    tab.focusPending.add(pending);
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
+    return work().finally(() => {
+      if (!tab.focusPending.delete(pending)) return;
+      tab.focusUses += 1;
+      releaseFocusWhenIdle(tab);
+    });
   };
 
-  /** A released relay's screencast has no viewer left to stop it. */
+  /**
+   * Chromium can leave a command unanswered, so the screenshot guard's release points
+   * also end every hold: a released relay has no one waiting, and a new document answers
+   * nothing pending from the old one. A released relay's screencast has no viewer to stop it.
+   */
+  const dropFocusHolds = (tab: AttachedTab) => {
+    tab.focusPending.clear();
+    releaseFocusWhenIdle(tab);
+  };
+
   const dropRelay = (tab: AttachedTab) => {
     tab.relay = null;
     tab.screencasting = false;
-    releaseFocusWhenIdle(tab);
+    dropFocusHolds(tab);
   };
 
   const relayFor = (tab: AttachedTab) => {
@@ -187,13 +207,16 @@ export const make = Effect.gen(function* () {
         send: (method, params, sessionId) => {
           if (method === "Page.startScreencast") tab.screencasting = true;
           else if (method === "Page.stopScreencast") tab.screencasting = false;
-          useFocus(tab);
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
-          const forward = () =>
-            method === "Page.captureScreenshot"
-              ? takeScreenshot(tab, relay, () => send(method, params, sessionId))
-              : send(method, params, sessionId);
-          return tab.focusChange === null ? forward() : tab.focusChange.then(forward);
+          const forward = () => {
+            const change = tab.focusChange;
+            const run = () => send(method, params, sessionId);
+            return change === null ? run() : change.then(run);
+          };
+          // A screenshot holds focus only once its turn starts, not while queued behind another.
+          return method === "Page.captureScreenshot"
+            ? takeScreenshot(tab, relay, () => holdFocus(tab, forward))
+            : holdFocus(tab, forward);
         },
         targetId: () =>
           debuggee
@@ -254,6 +277,7 @@ export const make = Effect.gen(function* () {
       focusEmulated: false,
       focusChange: null,
       focusUses: 0,
+      focusPending: new Set(),
       focusReleasing: false,
       screencasting: false,
       onMessage: (_event, method, params, sessionId) => {
@@ -267,6 +291,7 @@ export const make = Effect.gen(function* () {
       // stay unanswered. A crashed page lands here once it reloads, well after its renderer died.
       onNewDocument: () => {
         if (tab.screenshotTurn !== null) nextScreenshot(tab);
+        dropFocusHolds(tab);
       },
     };
     tabs.set(id, tab);
