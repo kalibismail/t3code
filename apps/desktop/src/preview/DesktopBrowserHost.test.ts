@@ -282,6 +282,22 @@ describe("DesktopBrowserHost", () => {
     }),
   );
 
+  it.effect("keeps a guest focused for the screenshot a navigation lets start", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+
+      yield* command(host, 1, "Page.captureScreenshot");
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
+      debuggee.navigate();
+      expect(debuggee.sent).toEqual([1, 2]);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+    }),
+  );
+
   it.effect("keeps a guest the agent used focused through its turn's pauses", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;
@@ -329,6 +345,28 @@ describe("DesktopBrowserHost", () => {
         yield* TestClock.adjust("1 minute");
         expect(debuggee.focusEmulation).toEqual([true, false]);
       }),
+  );
+
+  it.effect("keeps a viewer's pending command focused after the agent's turn ends", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      yield* turn(true);
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* raw({ id: 2, method: "Runtime.evaluate", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      yield* turn(false);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("lets a guest throttle once the session waiting on its command detaches", () =>
@@ -385,6 +423,38 @@ describe("DesktopBrowserHost", () => {
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true, false, true, false]);
     }),
+  );
+
+  it.effect("keeps a guest focused while any of its screencasts runs", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      // Two viewers, or a viewer and a recording, each on its own session.
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      yield* raw({ id: 2, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect([yield* Queue.take(replies), yield* Queue.take(replies)]).toEqual([1, 2]);
+      yield* raw({ id: 3, method: "Page.startScreencast", sessionId: "t3-preview-page-1" });
+      yield* raw({ id: 4, method: "Page.startScreencast", sessionId: "t3-preview-page-2" });
+      yield* raw({ id: 5, method: "Page.stopScreencast", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      debuggee.release();
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true]);
+
+      yield* raw({
+        id: 6,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-2" },
+      });
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("saves a server tab's download under its CDP guid where the server asked", () =>

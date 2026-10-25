@@ -65,14 +65,8 @@ describe("CDP relay", () => {
     ]);
     pending[0]!();
     await settle();
-    expect(send).toHaveBeenNthCalledWith(
-      1,
-      "Page.captureScreenshot",
-      {},
-      undefined,
-      "t3-preview-page",
-    );
-    expect(send).toHaveBeenNthCalledWith(2, "DOM.enable", {}, "iframe-session", "iframe-session");
+    expect(send).toHaveBeenNthCalledWith(1, "Page.captureScreenshot", {}, undefined, undefined);
+    expect(send).toHaveBeenNthCalledWith(2, "DOM.enable", {}, "iframe-session", undefined);
     expect(written.at(-1)).toEqual({
       id: 5,
       result: { method: "Page.captureScreenshot" },
@@ -99,7 +93,7 @@ describe("CDP relay", () => {
     );
     await settle();
     expect(send.mock.calls).toEqual([
-      ["Runtime.runIfWaitingForDebugger", {}, "iframe-session", "iframe-session"],
+      ["Runtime.runIfWaitingForDebugger", {}, "iframe-session", undefined],
     ]);
   });
 

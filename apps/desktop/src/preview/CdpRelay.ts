@@ -5,7 +5,7 @@ export interface CdpRelayTarget {
     method: string,
     params: Record<string, unknown>,
     sessionId: string | undefined,
-    /** The relay session that sent it; a detached one waits on nothing it sent. */
+    /** The extra session that sent it, such as a viewer's; the main connection has none. */
     owner?: string,
   ) => Promise<unknown>;
   readonly sessionDetached?: (owner: string) => void;
@@ -138,13 +138,15 @@ export function createCdpRelayConnection(
 
   const pageCommand = (command: CdpCommand): Promise<unknown> => {
     const child = sessions.get(command.sessionId!) === "page" ? undefined : command.sessionId;
+    const owner =
+      child === undefined && command.sessionId !== PAGE_SESSION_ID ? command.sessionId : undefined;
     // Child frames/workers pause on auto-attach until resumed; only the main page can skip this command.
     if (command.method === "Runtime.runIfWaitingForDebugger" && child === undefined) {
       return Promise.resolve({});
     }
     // Playwright asks for this on every page; the host emulates focus only while it is in use.
     if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
-    return target.send(command.method, command.params ?? {}, child, command.sessionId);
+    return target.send(command.method, command.params ?? {}, child, owner);
   };
 
   return {

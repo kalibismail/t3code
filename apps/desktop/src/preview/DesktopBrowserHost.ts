@@ -49,12 +49,13 @@ interface AttachedTab {
   focusEmulated: boolean;
   focusChange: Promise<void> | null;
   focusUses: number;
-  /** Each pending command, by the relay session waiting on it. */
+  /** Each pending command, by the extra session waiting on it; the main connection's have none. */
   readonly focusPending: Map<object, string | undefined>;
   /** Used by the agent during its thread's current turn. */
   turnHeld: boolean;
   focusReleasing: boolean;
-  screencasting: boolean;
+  /** The sessions streaming the guest; one stopping leaves the others' screencasts running. */
+  readonly screencasts: Set<string | undefined>;
   readonly onMessage: (
     event: Electron.Event,
     method: string,
@@ -164,7 +165,7 @@ export const make = Effect.gen(function* () {
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
         // The last pending command to settle starts another idle wait.
-        if (tab.focusPending.size > 0 || tab.screencasting || tab.turnHeld) return;
+        if (tab.focusPending.size > 0 || tab.screencasts.size > 0 || tab.turnHeld) return;
         if (tabs.get(keyOf(tab.key)) === tab) setFocusEmulation(tab, false);
       }),
     );
@@ -175,7 +176,8 @@ export const make = Effect.gen(function* () {
     const pending = {};
     tab.focusPending.set(pending, owner);
     // The agent pauses to think between steps; its tab stays focused until the turn ends.
-    if (agentTurns.has(tab.key.threadId)) tab.turnHeld = true;
+    // Viewers and recordings use extra sessions; only the main connection is the agent's.
+    if (owner === undefined && agentTurns.has(tab.key.threadId)) tab.turnHeld = true;
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
@@ -198,17 +200,22 @@ export const make = Effect.gen(function* () {
 
   const dropRelay = (tab: AttachedTab) => {
     tab.relay = null;
-    tab.screencasting = false;
+    tab.screencasts.clear();
     tab.turnHeld = false;
     dropFocusHolds(tab);
   };
 
-  /** A detached session, such as a closed viewer, waits on nothing it sent. */
-  const dropSessionHolds = (tab: AttachedTab, owner: string) => {
+  const dropOwnerHolds = (tab: AttachedTab, owner: string | undefined) => {
     for (const [pending, sender] of tab.focusPending) {
       if (sender === owner) tab.focusPending.delete(pending);
     }
     releaseFocusWhenIdle(tab);
+  };
+
+  /** A detached session, such as a closed viewer, waits on nothing it sent. */
+  const dropSessionHolds = (tab: AttachedTab, owner: string) => {
+    tab.screencasts.delete(owner);
+    dropOwnerHolds(tab, owner);
   };
 
   /**
@@ -220,7 +227,7 @@ export const make = Effect.gen(function* () {
     for (const tab of tabs.values()) {
       if (tab.key.threadId !== threadId) continue;
       tab.turnHeld = false;
-      dropFocusHolds(tab);
+      dropOwnerHolds(tab, undefined);
     }
   };
 
@@ -234,8 +241,8 @@ export const make = Effect.gen(function* () {
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId, owner) => {
-          if (method === "Page.startScreencast") tab.screencasting = true;
-          else if (method === "Page.stopScreencast") tab.screencasting = false;
+          if (method === "Page.startScreencast") tab.screencasts.add(owner);
+          else if (method === "Page.stopScreencast") tab.screencasts.delete(owner);
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
           const forward = () => {
             const change = tab.focusChange;
@@ -310,7 +317,7 @@ export const make = Effect.gen(function* () {
       focusPending: new Map(),
       turnHeld: false,
       focusReleasing: false,
-      screencasting: false,
+      screencasts: new Set(),
       onMessage: (_event, method, params, sessionId) => {
         if (method === "Browser.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
@@ -321,8 +328,9 @@ export const make = Effect.gen(function* () {
       // A screenshot pending when the page loads a new document, a reload included, can
       // stay unanswered. A crashed page lands here once it reloads, well after its renderer died.
       onNewDocument: () => {
-        if (tab.screenshotTurn !== null) nextScreenshot(tab);
+        // Before the next screenshot starts, so its own hold survives.
         dropFocusHolds(tab);
+        if (tab.screenshotTurn !== null) nextScreenshot(tab);
       },
     };
     tabs.set(id, tab);
