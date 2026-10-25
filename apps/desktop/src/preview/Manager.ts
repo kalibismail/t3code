@@ -1951,6 +1951,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         controller: current?.controller ?? "none",
         capturing: current?.capturing ?? false,
         ...(current?.favicon ? { favicon: current.favicon } : {}),
+        ...(current?.serverTab ? { serverTab: current.serverTab } : {}),
         updatedAt,
       };
       return [
