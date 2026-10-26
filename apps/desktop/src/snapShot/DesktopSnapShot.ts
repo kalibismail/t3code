@@ -490,7 +490,7 @@ async function captureSource({
       ({ source, png } = await captureRegionWindowSnapshot(
         regionSnapShotPool,
         active,
-        snapShotFlashBounds(active, platform),
+        active.bounds,
         snapShotThumbnailSize(active),
       ));
     } else {
