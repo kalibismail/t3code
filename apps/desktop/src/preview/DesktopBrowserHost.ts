@@ -44,8 +44,12 @@ interface AttachedTab {
   readonly debuggee: DesktopBrowserTabDebugger;
   relay: CdpRelayConnection | null;
   screenshotTurn: object | null;
-  /** `live` while whoever queued it still waits on it. */
-  readonly waitingScreenshots: Array<{ readonly start: () => void; readonly live: () => boolean }>;
+  /** Each holds focus and painting while `held` and whoever queued it still waits on it. */
+  readonly waitingScreenshots: Array<{
+    readonly start: () => void;
+    readonly live: () => boolean;
+    held: boolean;
+  }>;
   downloadDirectory: string | null;
   pendingDownloadGuid: string | null;
   agentInputAt: number;
@@ -156,7 +160,7 @@ export const make = Effect.gen(function* () {
       if (tab.screenshotTurn === null) start();
       else {
         // The one ahead may be abandoned mid-capture; it needs frames to finish and free its turn.
-        tab.waitingScreenshots.push({ start, live });
+        tab.waitingScreenshots.push({ start, live, held: true });
         setFocusEmulation(tab, true);
         syncPainting(tab);
       }
@@ -183,6 +187,9 @@ export const make = Effect.gen(function* () {
     tab.focusChange = change;
   };
 
+  const waitingHolds = (tab: AttachedTab) =>
+    tab.waitingScreenshots.some((waiting) => waiting.held && waiting.live());
+
   const releaseFocusWhenIdle = (tab: AttachedTab) => {
     if (tab.focusReleasing) return;
     tab.focusReleasing = true;
@@ -195,11 +202,7 @@ export const make = Effect.gen(function* () {
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
         // The last pending command to settle starts another idle wait.
-        if (
-          tab.focusPending.size > 0 ||
-          tab.screencasts.size > 0 ||
-          tab.waitingScreenshots.some((waiting) => waiting.live())
-        ) {
+        if (tab.focusPending.size > 0 || tab.screencasts.size > 0 || waitingHolds(tab)) {
           return;
         }
         // The agent pauses to think between steps; its tab stays focused until the turn ends.
@@ -219,7 +222,7 @@ export const make = Effect.gen(function* () {
     const active =
       tabs.get(keyOf(tab.key)) === tab &&
       (tab.screencasts.size > 0 ||
-        tab.waitingScreenshots.some((waiting) => waiting.live()) ||
+        waitingHolds(tab) ||
         [...tab.focusPending.values()].some((hold) => hold.paints));
     if (tab.painting === active) return;
     tab.painting = active;
@@ -256,6 +259,7 @@ export const make = Effect.gen(function* () {
    */
   const dropFocusHolds = (tab: AttachedTab) => {
     tab.focusPending.clear();
+    for (const waiting of tab.waitingScreenshots) waiting.held = false;
     releaseFocusWhenIdle(tab);
     syncPainting(tab);
   };
@@ -324,7 +328,15 @@ export const make = Effect.gen(function* () {
                 () => owner === undefined || !detachedOwners.has(owner),
                 (current) => holdFocus(tab, method, owner, () => forward(current)),
               )
-            : holdFocus(tab, method, owner, forward);
+            : method === "Page.startScreencast"
+              ? holdFocus(tab, method, owner, forward).catch((cause: unknown) => {
+                  // A viewer can outlive a refused stream; nothing is streaming for it.
+                  tab.screencasts.delete(owner);
+                  releaseFocusWhenIdle(tab);
+                  syncPainting(tab);
+                  throw cause;
+                })
+              : holdFocus(tab, method, owner, forward);
         },
         sessionDetached: (owner) => {
           detachedOwners.add(owner);

@@ -31,7 +31,9 @@ const command = (
     }),
   );
 
-const makeDebuggee = (options: { readonly deferFocus?: boolean } = {}) => {
+const makeDebuggee = (
+  options: { readonly deferFocus?: boolean; readonly refuse?: string } = {},
+) => {
   const emitter = new NodeEvents.EventEmitter();
   const pending: Array<() => void> = [];
   const focusChanges: Array<() => void> = [];
@@ -40,7 +42,11 @@ const makeDebuggee = (options: { readonly deferFocus?: boolean } = {}) => {
   const focusEmulation: Array<boolean> = [];
   const debuggee = Object.assign(emitter, {
     sendCommand: (method: string, params?: { id?: number; enabled?: boolean }) =>
-      new Promise((resolve) => {
+      new Promise((resolve, reject) => {
+        if (method === options.refuse) {
+          reject(new Error("Refused"));
+          return;
+        }
         if (method === "Target.getTargetInfo") {
           resolve({ targetInfo: { targetId: "GUEST" } });
           return;
@@ -552,6 +558,48 @@ describe("DesktopBrowserHost", () => {
       debuggee.settleFocus();
       yield* settle;
       expect(debuggee.sent).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("stops painting for a screenshot still queued when the agent's turn ends", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const painting = yield* watchPainting(host);
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      yield* turn(true);
+      yield* command(host, 1, "Page.captureScreenshot");
+      yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
+      yield* turn(false);
+      yield* settle;
+      expect(painting).toEqual([true, false]);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("lets a guest throttle when Chromium refuses a viewer's screencast", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee({ refuse: "Page.startScreencast" });
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const painting = yield* watchPainting(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* raw({ id: 2, method: "Page.startScreencast", sessionId: "t3-preview-page-1" });
+      expect(yield* Queue.take(replies)).toBe(2);
+      yield* settle;
+      expect(painting).toEqual([true, false]);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
     }).pipe(Effect.scoped),
   );
 
