@@ -44,7 +44,8 @@ interface AttachedTab {
   readonly debuggee: DesktopBrowserTabDebugger;
   relay: CdpRelayConnection | null;
   screenshotTurn: object | null;
-  readonly waitingScreenshots: Array<() => void>;
+  /** `live` while whoever queued it still waits on it. */
+  readonly waitingScreenshots: Array<{ readonly start: () => void; readonly live: () => boolean }>;
   downloadDirectory: string | null;
   pendingDownloadGuid: string | null;
   agentInputAt: number;
@@ -118,7 +119,7 @@ export const make = Effect.gen(function* () {
 
   const nextScreenshot = (tab: AttachedTab) => {
     tab.screenshotTurn = null;
-    tab.waitingScreenshots.shift()?.();
+    tab.waitingScreenshots.shift()?.start();
     releaseFocusWhenIdle(tab);
     syncPainting(tab);
   };
@@ -127,24 +128,26 @@ export const make = Effect.gen(function* () {
    * Chromium below 157 crashes the whole app when a guest's renderer exits with a
    * screenshot copy in flight (crbug.com/567321049). Overlapping screenshots make that
    * far likelier, and one the server gave up on stays pending in Chromium, so each guest
-   * gets one at a time. One queued by a relay released since then is dropped unsent.
+   * gets one at a time. One whose relay or session has since gone is dropped unsent.
    */
   const takeScreenshot = (
     tab: AttachedTab,
     relay: CdpRelayConnection,
+    ownerLive: () => boolean,
     /** Sends only while `current` holds, which focus emulation may outlast. */
     capture: (current: () => boolean) => Promise<unknown>,
   ) =>
     new Promise<unknown>((resolve, reject) => {
+      const live = () => tab.relay === relay && ownerLive();
       const start = () => {
-        if (tab.relay !== relay) {
+        if (!live()) {
           reject(new Error("The preview connection that asked for this screenshot closed."));
           nextScreenshot(tab);
           return;
         }
         const turn = {};
         tab.screenshotTurn = turn;
-        capture(() => tab.screenshotTurn === turn && tab.relay === relay)
+        capture(() => tab.screenshotTurn === turn && live())
           .finally(() => {
             if (tab.screenshotTurn === turn) nextScreenshot(tab);
           })
@@ -153,7 +156,7 @@ export const make = Effect.gen(function* () {
       if (tab.screenshotTurn === null) start();
       else {
         // The one ahead may be abandoned mid-capture; it needs frames to finish and free its turn.
-        tab.waitingScreenshots.push(start);
+        tab.waitingScreenshots.push({ start, live });
         setFocusEmulation(tab, true);
         syncPainting(tab);
       }
@@ -195,7 +198,7 @@ export const make = Effect.gen(function* () {
         if (
           tab.focusPending.size > 0 ||
           tab.screencasts.size > 0 ||
-          tab.waitingScreenshots.length > 0
+          tab.waitingScreenshots.some((waiting) => waiting.live())
         ) {
           return;
         }
@@ -216,7 +219,7 @@ export const make = Effect.gen(function* () {
     const active =
       tabs.get(keyOf(tab.key)) === tab &&
       (tab.screencasts.size > 0 ||
-        tab.waitingScreenshots.length > 0 ||
+        tab.waitingScreenshots.some((waiting) => waiting.live()) ||
         [...tab.focusPending.values()].some((hold) => hold.paints));
     if (tab.painting === active) return;
     tab.painting = active;
@@ -315,10 +318,11 @@ export const make = Effect.gen(function* () {
             return change === null ? run() : change.then(run);
           };
           return method === "Page.captureScreenshot"
-            ? takeScreenshot(tab, relay, (current) =>
-                owner !== undefined && detachedOwners.has(owner)
-                  ? Promise.reject(new Error("The session that asked for this screenshot closed."))
-                  : holdFocus(tab, method, owner, () => forward(current)),
+            ? takeScreenshot(
+                tab,
+                relay,
+                () => owner === undefined || !detachedOwners.has(owner),
+                (current) => holdFocus(tab, method, owner, () => forward(current)),
               )
             : holdFocus(tab, method, owner, forward);
         },

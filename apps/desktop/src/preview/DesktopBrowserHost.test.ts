@@ -497,6 +497,64 @@ describe("DesktopBrowserHost", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("stops painting for a queued screenshot once its session detaches", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const painting = yield* watchPainting(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+      const turn = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "turn", threadId: key.threadId, active }));
+
+      // The agent's screenshot is abandoned at turn end; a viewer's waits behind it, then leaves.
+      yield* turn(true);
+      yield* command(host, 1, "Page.captureScreenshot");
+      yield* settle;
+      yield* turn(false);
+      yield* raw({ id: 2, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(2);
+      yield* raw({ id: 3, method: "Page.captureScreenshot", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      expect(painting).toEqual([true, false, true]);
+      yield* raw({
+        id: 4,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-1" },
+      });
+      expect(yield* Queue.take(replies)).toBe(4);
+      expect(painting).toEqual([true, false, true, false]);
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("never sends a screenshot whose session detached while focus was changing", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee({ deferFocus: true });
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* raw({ id: 2, method: "Page.captureScreenshot", sessionId: "t3-preview-page-1" });
+      yield* raw({
+        id: 3,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-1" },
+      });
+      expect(yield* Queue.take(replies)).toBe(3);
+      debuggee.settleFocus();
+      yield* settle;
+      expect(debuggee.sent).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("ignores a screencast that arrives on a session after it detached", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;
@@ -571,7 +629,8 @@ describe("DesktopBrowserHost", () => {
       yield* settle;
       debuggee.release();
       expect(yield* Queue.take(replies)).toBe(4);
-      expect(yield* Queue.take(replies)).toBe(2);
+      // The dropped screenshot's error reply leaves as the first frees its turn.
+      expect([yield* Queue.take(replies), yield* Queue.take(replies)]).toEqual([3, 2]);
       yield* settle;
       expect(debuggee.sent).toEqual([2]);
 
