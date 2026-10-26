@@ -100,7 +100,8 @@ export function usePreviewBridge(input: {
   }, [
     runtimeTabId,
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- A different tab or thread starts its status reports and pointer tracking from scratch.
-    stableThreadRef,
+    environmentId,
+    threadId,
     tabId,
   ]);
 }

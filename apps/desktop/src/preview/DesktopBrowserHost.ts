@@ -284,6 +284,7 @@ export const make = Effect.gen(function* () {
       sessionId === undefined
         ? sendPageCommand(webContents, debuggee, method, params)
         : debuggee.sendCommand(method, params, sessionId);
+    const detachedOwners = new Set<string>();
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId, owner) => {
@@ -301,11 +302,16 @@ export const make = Effect.gen(function* () {
           // A screenshot holds focus only once its turn starts, not while queued behind another.
           return method === "Page.captureScreenshot"
             ? takeScreenshot(tab, relay, (current) =>
-                holdFocus(tab, method, owner, () => forward(current)),
+                owner !== undefined && detachedOwners.has(owner)
+                  ? Promise.reject(new Error("The session that asked for this screenshot closed."))
+                  : holdFocus(tab, method, owner, () => forward(current)),
               )
             : holdFocus(tab, method, owner, forward);
         },
-        sessionDetached: (owner) => dropSessionHolds(tab, owner),
+        sessionDetached: (owner) => {
+          detachedOwners.add(owner);
+          dropSessionHolds(tab, owner);
+        },
         targetId: () =>
           debuggee
             .sendCommand("Target.getTargetInfo")
