@@ -22,7 +22,7 @@ const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBr
 const lineEncoder = new TextEncoder();
 const AGENT_INPUT_COMMAND =
   /"method":"(?:Input\.|Page\.navigate"|Runtime\.(?:evaluate|callFunctionOn)")/;
-/** The same commands as above, by method, for the main connection's sends. */
+/** The same commands as above, by method, for the relay's sends. */
 const AGENT_INPUT_METHOD = /^(?:Input\.|Page\.navigate$|Runtime\.(?:evaluate|callFunctionOn)$)/;
 const AGENT_DOWNLOAD_WINDOW_MS = 5_000;
 const FOCUS_IDLE = "5 seconds";
@@ -238,8 +238,6 @@ export const make = Effect.gen(function* () {
   ) => {
     const pending = {};
     tab.focusPending.set(pending, { owner, paints: method === "Page.captureScreenshot" });
-    // Playwright's own housekeeping is not the agent using the tab.
-    if (AGENT_INPUT_METHOD.test(method)) tab.agentUsed = true;
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
@@ -303,14 +301,24 @@ export const make = Effect.gen(function* () {
         ? sendPageCommand(webContents, debuggee, method, params)
         : debuggee.sendCommand(method, params, sessionId);
     const detachedOwners = new Set<string>();
+    /** Viewers and recordings stream; the agent's own sessions never do. */
+    const streamingOwners = new Set<string>();
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId, owner) => {
           // A child session's screencast is not the page's, such as a late one on a detached session.
           if (sessionId === undefined && method === "Page.startScreencast") {
             tab.screencasts.add(owner);
+            if (owner !== undefined) streamingOwners.add(owner);
           } else if (sessionId === undefined && method === "Page.stopScreencast") {
             tab.screencasts.delete(owner);
+          }
+          // A person's input through a viewer, or Playwright's own housekeeping, is not the agent's.
+          if (
+            AGENT_INPUT_METHOD.test(method) &&
+            (owner === undefined || !streamingOwners.has(owner))
+          ) {
+            tab.agentUsed = true;
           }
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
           const forward = (current?: () => boolean) => {

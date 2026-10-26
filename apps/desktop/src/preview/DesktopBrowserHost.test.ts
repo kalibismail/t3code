@@ -603,6 +603,35 @@ describe("DesktopBrowserHost", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("lets a guest throttle after a person's input through a viewer that then closed", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (message: Record<string, unknown>) =>
+        host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+
+      yield* host.handleCommandLine(
+        encodeJson({ type: "turn", threadId: key.threadId, active: true }),
+      );
+      yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+      expect(yield* Queue.take(replies)).toBe(1);
+      yield* raw({ id: 2, method: "Page.startScreencast", sessionId: "t3-preview-page-1" });
+      yield* raw({ id: 3, method: "Input.dispatchMouseEvent", sessionId: "t3-preview-page-1" });
+      yield* settle;
+      debuggee.release();
+      yield* raw({
+        id: 4,
+        method: "Target.detachFromTarget",
+        params: { sessionId: "t3-preview-page-1" },
+      });
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("ignores a screencast that arrives on a session after it detached", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;
