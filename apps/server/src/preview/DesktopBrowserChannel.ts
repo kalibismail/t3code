@@ -49,7 +49,7 @@ export class DesktopBrowserChannel extends Context.Service<
       key: DesktopTabKey,
       pointer: { readonly phase: "move" | "click"; readonly x: number; readonly y: number },
     ) => Effect.Effect<void>;
-    /** Never fails: an undelivered change leaves the guest to its idle release. */
+    /** Never fails. A failed write means a broken channel; the next backend starts with no turns. */
     readonly turn: (threadId: string, active: boolean) => Effect.Effect<void>;
   }
 >()("t3/preview/DesktopBrowserChannel") {}
