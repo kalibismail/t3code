@@ -1,4 +1,6 @@
+import { makeRestrictedChatGptJob } from "../../textGeneration/RestrictedChatGptJob.ts";
 import {
+  RestrictedTextJobError,
   ProviderDriverKind,
   ProviderSetupError,
   TextGenerationError,
@@ -9,6 +11,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
 import { makeCodexTextGeneration } from "../../textGeneration/CodexTextGeneration.ts";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -30,6 +33,7 @@ import {
 import { codexContinuationIdentity } from "./CodexHomeLayout.ts";
 import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
 import { HttpClient } from "effect/http";
+const isRestrictedTextJobError = Schema.is(RestrictedTextJobError);
 const DRIVER = ProviderDriverKind.make("codex");
 
 export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(function* (
@@ -256,6 +260,16 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
         }),
     ),
   );
+  const restrictedJob = yield* makeRestrictedChatGptJob(runtime.auth.access);
+  const restrictedTextJob: NonNullable<ProviderInstance["restrictedTextJob"]> = (input) =>
+    runtime.auth.controller.withAccess!(restrictedJob(input)).pipe(
+      Effect.scoped,
+      Effect.mapError((error) =>
+        isRestrictedTextJobError(error)
+          ? error
+          : new RestrictedTextJobError({ reason: "sign_in_required" }),
+      ),
+    );
   const nativeGeneration = yield* makeCodexTextGeneration(
     config,
     undefined,
@@ -295,6 +309,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
     snapshot,
     orchestrationAdapter,
     textGeneration,
+    restrictedTextJob,
     auth: runtime.auth.controller,
     snapshotForCwd: (cwd: string) =>
       enabled

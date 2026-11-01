@@ -19,6 +19,27 @@ reconnect later.
 If remote sign-in cannot return automatically, paste the full URL from the final
 localhost page into the sign-in panel, even if that page could not load.
 
+## Restricted text jobs
+
+Automations can call the authenticated `textJobs.run` RPC to process text without
+starting a coding thread. Select a ChatGPT account connected through T3 Code and
+an available model; existing CLI logins and other providers are unsupported.
+The request supplies `instanceId`, `model`, `serviceTier: "default"`, trusted
+`instructions` and untrusted `input`. Ask for a JSON object in the instructions.
+The response contains `result` and content-free `evidence`; validate the result
+against your application's own contract before using it.
+
+Jobs have no tools or access to files, MCP servers, apps, plugins, hooks or skills.
+T3 does not save their input or output in conversation history. OpenAI's data
+policies still apply: `store: false` disables response-object storage, not all
+provider retention. Only completed text output is accepted; tool calls, reasoning
+items and other non-text output fail the job. There is no provider or billing
+fallback and no automatic retry.
+
+The limits are 32 KiB of instructions, 128 KiB of input, 64 KiB of returned JSON,
+1 MiB of upstream streaming data, 90 seconds and two concurrent jobs per server.
+Excess jobs return `busy`. Cancelling the RPC aborts the upstream request.
+
 ## Use an existing Codex login
 
 T3 Code can use your installed Codex and its existing login. Run `codex login`

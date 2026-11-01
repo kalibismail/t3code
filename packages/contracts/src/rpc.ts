@@ -1,4 +1,9 @@
 import {
+  RestrictedTextJobInput,
+  RestrictedTextJobResult,
+  RestrictedTextJobError,
+} from "./restrictedTextJob.ts";
+import {
   OrchestrationV2SearchThreadError,
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -486,6 +491,7 @@ export const WS_METHODS = {
   deviceDetail: "device.detail",
   deviceAction: "device.action",
 
+  restrictedTextJob: "textJobs.run",
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
@@ -612,6 +618,12 @@ const WsServerRemoveKeybindingRpc = Rpc.make(WS_METHODS.serverRemoveKeybinding, 
   payload: ServerRemoveKeybindingInput,
   success: ServerRemoveKeybindingResult,
   error: Schema.Union([KeybindingsConfigError, EnvironmentAuthorizationError]),
+});
+
+const WsRestrictedTextJobRpc = Rpc.make(WS_METHODS.restrictedTextJob, {
+  payload: RestrictedTextJobInput,
+  success: RestrictedTextJobResult,
+  error: Schema.Union([RestrictedTextJobError, EnvironmentAuthorizationError]),
 });
 
 const WsServerProbeRpc = Rpc.make(WS_METHODS.serverProbe, {
@@ -1934,6 +1946,7 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 
 export const WsRpcGroup = RpcGroup.make(
   WsGuestShareCreateRpc,
+  WsRestrictedTextJobRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

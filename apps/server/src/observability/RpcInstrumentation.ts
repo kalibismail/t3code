@@ -30,6 +30,7 @@ const RPC_AGGREGATES = {
   [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: "orchestrationV2",
   [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: "orchestrationV2",
   [WS_METHODS.projectsMutate]: "orchestration",
+  [WS_METHODS.restrictedTextJob]: "provider",
   [WS_METHODS.serverProbe]: "server",
   [WS_METHODS.serverGetConfig]: "server",
   [WS_METHODS.serverRefreshProviders]: "server",
@@ -223,6 +224,7 @@ const DEFAULT_RPC_SPAN_ATTRIBUTES = {
   "rpc.system": "effect-rpc",
 } as const;
 const RPC_METHODS_WITH_TRACING_DISABLED: ReadonlySet<string> = new Set([
+  WS_METHODS.restrictedTextJob,
   WS_METHODS.serverGetTraceDiagnostics,
   WS_METHODS.serverGetProcessDiagnostics,
   WS_METHODS.serverGetProcessResourceHistory,

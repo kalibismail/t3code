@@ -1,5 +1,8 @@
 // Context tags are runtime singletons; drivers need multiple instances.
 import type {
+  RestrictedTextJobInput,
+  RestrictedTextJobResult,
+  RestrictedTextJobError,
   ProviderConsumeResetCreditOutcome,
   AcpRegistryListSessionsResult,
   AcpRegistryListProvidersResult,
@@ -51,6 +54,9 @@ export interface ProviderInstance {
   >;
   readonly orchestrationAdapter: ProviderAdapter.ProviderAdapterV2["Service"];
   readonly textGeneration: ProviderTextGeneration;
+  readonly restrictedTextJob?: (
+    input: RestrictedTextJobInput,
+  ) => Effect.Effect<RestrictedTextJobResult, RestrictedTextJobError>;
   readonly auth?: ProviderAuthController;
   readonly acpSessionManagement?: {
     readonly listSessions: (input: {

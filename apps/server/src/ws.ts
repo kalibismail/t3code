@@ -1,3 +1,4 @@
+import * as RestrictedTextJobs from "./textGeneration/RestrictedTextJobs.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -1323,6 +1324,7 @@ export const layerWsRpc = (
       const modelManifest = yield* ModelManifest.ModelManifest;
       const providerLatestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
       const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+      const restrictedTextJobs = yield* RestrictedTextJobs.RestrictedTextJobs;
       const acpRegistryCatalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
       const acpRegistryRuntimeCoordinator =
         yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
@@ -2171,6 +2173,7 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.getWebhookDelivery(input)),
           ),
+        [WS_METHODS.restrictedTextJob]: (input) => restrictedTextJobs.run(input),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) =>
           loadServerConfig({ usageLimitsCommand: false, workspaceSnapshotsOnDemand: false }),
@@ -3261,6 +3264,7 @@ export const WS_RPC_SERVER_OPTIONS = {
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
+    const restrictedTextJobs = yield* RestrictedTextJobs.RestrictedTextJobs;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -3329,6 +3333,9 @@ export const layer = Layer.unwrap(
         }).pipe(
           Effect.provide(
             layerWsRpc(session, clientAnalyticsProps, serverBrowser).pipe(
+              Layer.provide(
+                Layer.succeed(RestrictedTextJobs.RestrictedTextJobs, restrictedTextJobs),
+              ),
               Layer.provideMerge(RpcSerialization.layerJson),
               // Handler-context reporters see only request defects, not server-wide defects.
               Layer.provide(DefectReporter.layer),

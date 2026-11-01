@@ -1,3 +1,4 @@
+import * as RestrictedTextJobs from "./textGeneration/RestrictedTextJobs.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -516,6 +517,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ProjectStore.ProjectStoreV2)({}),
   Layer.mock(ProviderAuthService.ProviderAuthService)({}),
   Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
+  Layer.mock(RestrictedTextJobs.RestrictedTextJobs)({}),
   Layer.mock(ProviderLatestVersions.ProviderLatestVersions)({}),
   Layer.mock(ProviderMaintenanceRunner.ProviderMaintenanceRunner)({}),
   Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
