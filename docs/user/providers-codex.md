@@ -32,12 +32,13 @@ against your application's own contract before using it.
 Jobs have no tools or access to files, MCP servers, apps, plugins, hooks or skills.
 T3 does not save their input or output in conversation history. OpenAI's data
 policies still apply: `store: false` disables response-object storage, not all
-provider retention. Only completed text output is accepted; tool calls, reasoning
-items and other non-text output fail the job. There is no provider or billing
-fallback and no automatic retry.
+provider retention. Only completed assistant text is returned. Reasoning records
+are discarded; tool calls, refusals and other output fail the job. There is no
+provider or billing fallback and no automatic retry.
 
-The limits are 32 KiB of instructions, 128 KiB of input, 64 KiB of returned JSON,
-1 MiB of upstream streaming data, 90 seconds and two concurrent jobs per server.
+The UTF-8 limits are 32 KiB of instructions, 2 MiB of input and 250,000 bytes of
+returned JSON. Upstream streaming is limited to 8 MiB total.
+Jobs have a 90-second deadline and two concurrent slots per server.
 Excess jobs return `busy`. Cancelling the RPC aborts the upstream request.
 
 ## Use an existing Codex login

@@ -8,7 +8,7 @@ export const RestrictedTextJobInput = Schema.Struct({
   model: Schema.NonEmptyString.check(Schema.isMaxLength(200)),
   serviceTier: Schema.Literal("default"),
   instructions: Schema.NonEmptyString.check(Schema.isMaxLength(32_768)),
-  input: Schema.NonEmptyString.check(Schema.isMaxLength(131_072)),
+  input: Schema.NonEmptyString.check(Schema.isMaxLength(2_097_152)),
 }).pipe(
   Schema.middlewareDecoding((effect) =>
     effect.pipe(

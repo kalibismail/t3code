@@ -23,13 +23,23 @@ const Message = Schema.Struct({
     Schema.Struct({ type: Schema.Literal("output_text"), text: Schema.String }),
   ),
 });
+// Project reasoning to its tag/status so opaque content never survives decoding.
+const Reasoning = Schema.Struct({
+  type: Schema.Literal("reasoning"),
+  status: Schema.optional(Schema.Literal("completed")),
+});
 const Completed = Schema.Struct({
   status: Schema.Literal("completed"),
   model: Schema.String,
-  output: Schema.Array(Message),
+  output: Schema.Array(Schema.Union([Message, Reasoning])),
 });
 const Envelope = Schema.Struct({ type: Schema.String });
-const OutputEvent = Schema.Struct({ item: Schema.Struct({ type: Schema.Literal("message") }) });
+const OutputEvent = Schema.Struct({
+  item: Schema.Struct({ type: Schema.Literals(["message", "reasoning"]) }),
+});
+const ContentEvent = Schema.Struct({
+  part: Schema.Struct({ type: Schema.Literals(["output_text", "reasoning_text"]) }),
+});
 const CompletionEvent = Schema.Struct({ response: Completed });
 const UsageFailure = Schema.Struct({
   response: Schema.Struct({
@@ -45,6 +55,7 @@ const isUsageFailure = Schema.decodeUnknownEffect(Schema.fromJsonString(UsageFai
 const parseEvent = Schema.decodeUnknownEffect(Schema.fromJsonString(Envelope));
 const parseCompletion = Schema.decodeUnknownEffect(Schema.fromJsonString(CompletionEvent));
 const parseOutput = Schema.decodeUnknownEffect(Schema.fromJsonString(OutputEvent));
+const parseContent = Schema.decodeUnknownEffect(Schema.fromJsonString(ContentEvent));
 const parseResult = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.JsonObject));
 const allowedEvents = new Set([
   "response.created",
@@ -56,6 +67,12 @@ const allowedEvents = new Set([
   "response.output_text.delta",
   "response.output_text.done",
   "response.completed",
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_summary_text.done",
+  "response.reasoning_text.delta",
+  "response.reasoning_text.done",
 ]);
 
 export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(function* (
@@ -108,12 +125,12 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
       yield* response.stream.pipe(
         Stream.mapEffect((chunk) => {
           totalBytes += chunk.byteLength;
-          return totalBytes > 1_048_576
+          return totalBytes > 8_388_608
             ? Effect.fail(new RestrictedTextJobError({ reason: "output_limit" }))
             : Effect.succeed(chunk);
         }),
         Stream.decodeText(),
-        Stream.pipeThroughChannel(Sse.decode({ maxEventSize: 262_144 })),
+        Stream.pipeThroughChannel(Sse.decode({ maxEventSize: 2_097_152 })),
         Stream.runForEach(
           Effect.fnUntraced(function* (event) {
             if (event.data === "[DONE]" && completed) return;
@@ -139,6 +156,14 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
                 Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
               );
             }
+            if (
+              envelope.type === "response.content_part.added" ||
+              envelope.type === "response.content_part.done"
+            ) {
+              yield* parseContent(event.data).pipe(
+                Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
+              );
+            }
             if (envelope.type === "response.completed") {
               completed = (yield* parseCompletion(event.data).pipe(
                 Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
@@ -155,10 +180,10 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
       if (!completed || completed.model !== input.model)
         return yield* new RestrictedTextJobError({ reason: "invalid_output" });
       const output = completed.output
-        .flatMap((item) => item.content.map((part) => part.text))
+        .flatMap((item) => (item.type === "message" ? item.content.map((part) => part.text) : []))
         .join("");
       const outputBytes = new TextEncoder().encode(output).length;
-      if (outputBytes > 65_536)
+      if (outputBytes > 250_000)
         return yield* new RestrictedTextJobError({ reason: "output_limit" });
       const result = yield* parseResult(output).pipe(
         Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),

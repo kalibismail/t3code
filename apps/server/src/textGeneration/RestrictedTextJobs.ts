@@ -35,7 +35,7 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_input" })));
       if (
         new TextEncoder().encode(request.instructions).length > 32_768 ||
-        new TextEncoder().encode(request.input).length > 131_072
+        new TextEncoder().encode(request.input).length > 2_097_152
       ) {
         return yield* new RestrictedTextJobError({ reason: "invalid_input" });
       }

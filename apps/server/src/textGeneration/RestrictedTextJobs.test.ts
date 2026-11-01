@@ -112,78 +112,181 @@ const layerJobs = (run: ProviderInstance["restrictedTextJob"]) =>
     ),
   );
 
-it.effect("authorizes the public job before sending a bounded tool-free subscription request", () =>
-  Effect.gen(function* () {
-    const audit = diagnostics();
-    let requests = 0;
-    const http = HttpClient.make((outgoing) =>
-      Effect.sync(() => {
-        requests++;
-        assert.strictEqual(outgoing.headers.authorization, "Bearer synthetic-oauth");
-        if (outgoing.url === "https://api.openai.com/v1/models")
+it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
+  "authorizes the public job before sending a bounded tool-free subscription request: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const audit = diagnostics();
+      let requests = 0;
+      const input =
+        scenario === "full batch"
+          ? JSON.stringify(Array.from({ length: 60 }, (_, id) => ({ id, body: "郵".repeat(8000) })))
+          : scenario === "UTF-8 boundary"
+            ? "é".repeat(1_048_576)
+            : request.input;
+      const payload = { ...request, input };
+      const summary =
+        scenario === "small" || scenario === "reasoning"
+          ? "RESULT_MARKER"
+          : (scenario === "UTF-8 boundary" ? "\\" : "é").repeat(124_993);
+      const output = JSON.stringify({ summary });
+      const message = {
+        ...completed.response.output[0],
+        content: [{ type: "output_text", text: output }],
+      };
+      const reasoning = {
+        type: "reasoning",
+        id: "rs_test",
+        status: "completed",
+        summary: [],
+        encrypted_content: "OPAQUE_MARKER",
+      };
+      const reasoningEvents =
+        scenario === "reasoning"
+          ? [
+              { type: "response.output_item.added", item: { ...reasoning, status: "in_progress" } },
+              {
+                type: "response.reasoning_summary_part.added",
+                item_id: "rs_test",
+                output_index: 0,
+                summary_index: 0,
+                part: { type: "summary_text", text: "" },
+                sequence_number: 1,
+              },
+              {
+                type: "response.reasoning_summary_text.delta",
+                item_id: "rs_test",
+                output_index: 0,
+                summary_index: 0,
+                delta: "REASONING_MARKER",
+                sequence_number: 2,
+              },
+              {
+                type: "response.reasoning_summary_text.done",
+                item_id: "rs_test",
+                output_index: 0,
+                summary_index: 0,
+                text: "REASONING_MARKER",
+                sequence_number: 3,
+              },
+              {
+                type: "response.reasoning_summary_part.done",
+                item_id: "rs_test",
+                output_index: 0,
+                summary_index: 0,
+                part: { type: "summary_text", text: "REASONING_MARKER" },
+                sequence_number: 4,
+              },
+              {
+                type: "response.reasoning_text.delta",
+                item_id: "rs_test",
+                output_index: 0,
+                content_index: 0,
+                delta: "REASONING_MARKER",
+                sequence_number: 5,
+              },
+              {
+                type: "response.reasoning_text.done",
+                item_id: "rs_test",
+                output_index: 0,
+                content_index: 0,
+                text: "REASONING_MARKER",
+                sequence_number: 6,
+              },
+              { type: "response.output_item.done", item: reasoning },
+            ]
+          : [];
+      const events = [
+        ...reasoningEvents,
+        {
+          type: "response.output_item.added",
+          item: { ...message, status: "in_progress", content: [] },
+        },
+        { type: "response.content_part.added", part: { type: "output_text", text: "" } },
+        { type: "response.output_text.delta", delta: output },
+        { type: "response.output_text.done", text: output },
+        { type: "response.content_part.done", part: message.content[0] },
+        { type: "response.output_item.done", item: message },
+        {
+          ...completed,
+          response: {
+            ...completed.response,
+            output: scenario === "reasoning" ? [reasoning, message] : [message],
+          },
+        },
+      ];
+      const http = HttpClient.make((outgoing) =>
+        Effect.sync(() => {
+          requests++;
+          assert.strictEqual(outgoing.headers.authorization, "Bearer synthetic-oauth");
+          if (outgoing.url === "https://api.openai.com/v1/models")
+            return HttpClientResponse.fromWeb(
+              outgoing,
+              Response.json({
+                models: [
+                  { slug: "account-model", display_name: "Account model", visibility: "list" },
+                ],
+              }),
+            );
+          assert.strictEqual(outgoing.url, "https://api.openai.com/v1/responses");
+          assert.strictEqual(outgoing.method, "POST");
+          assert.strictEqual(outgoing.body._tag, "Uint8Array");
+          if (outgoing.body._tag !== "Uint8Array") throw new Error("Expected JSON request");
+          const body = JSON.parse(new TextDecoder().decode(outgoing.body.body));
+          assert.deepEqual(body, {
+            model: "account-model",
+            instructions: request.instructions,
+            input: [{ role: "user", content: [{ type: "input_text", text: input }] }],
+            tools: [],
+            tool_choice: "none",
+            store: false,
+            stream: true,
+            service_tier: "default",
+            text: { format: { type: "json_object" } },
+          });
           return HttpClientResponse.fromWeb(
             outgoing,
-            Response.json({
-              models: [
-                { slug: "account-model", display_name: "Account model", visibility: "list" },
-              ],
-            }),
+            new Response(sse(events), { headers: { "content-type": "text/event-stream" } }),
           );
-        assert.strictEqual(outgoing.url, "https://api.openai.com/v1/responses");
-        assert.strictEqual(outgoing.method, "POST");
-        assert.strictEqual(outgoing.body._tag, "Uint8Array");
-        if (outgoing.body._tag !== "Uint8Array") throw new Error("Expected JSON request");
-        const body = JSON.parse(new TextDecoder().decode(outgoing.body.body));
-        assert.deepEqual(body, {
-          model: "account-model",
-          instructions: request.instructions,
-          input: [{ role: "user", content: [{ type: "input_text", text: request.input }] }],
-          tools: [],
-          tool_choice: "none",
-          store: false,
-          stream: true,
-          service_tier: "default",
-          text: { format: { type: "json_object" } },
-        });
-        return HttpClientResponse.fromWeb(
-          outgoing,
-          new Response(sse([completed]), { headers: { "content-type": "text/event-stream" } }),
-        );
-      }),
-    );
-    const run = yield* makeRestrictedChatGptJob(Effect.succeed(credentials)).pipe(
-      Effect.provideService(HttpClient.HttpClient, http),
-    );
-    const jobs = yield* RestrictedTextJobs.RestrictedTextJobs.pipe(Effect.provide(layerJobs(run)));
-    const client = (
-      scopes: Array<typeof AuthOrchestrationOperateScope | typeof AuthOrchestrationReadScope>,
-    ) =>
-      RpcTest.makeClient(group).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            group.toLayerHandler(WS_METHODS.restrictedTextJob, (input) =>
-              jobs.run(input).pipe(audit.capture),
-            ),
-            RpcAuthorization.layer(scopes),
-          ),
-        ),
+        }),
       );
-    const invalid = yield* decodePayload({
-      ...request,
-      serviceTier: "BODY_MARKER",
-    }).pipe(Effect.flip);
-    assert.notInclude(invalid.message, "BODY_MARKER");
-    const denied = yield* client([AuthOrchestrationReadScope]);
-    const denial = yield* denied[WS_METHODS.restrictedTextJob](request).pipe(Effect.flip);
-    assert.strictEqual(denial._tag, "EnvironmentAuthorizationError");
-    assert.strictEqual(requests, 0);
-    const allowed = yield* client([AuthOrchestrationOperateScope]);
-    const result = yield* allowed[WS_METHODS.restrictedTextJob](request);
-    assert.deepEqual(result.result, { summary: "RESULT_MARKER" });
-    assert.strictEqual(requests, 2);
-    assert.deepEqual(audit.recorded, []);
-    assert.notInclude(JSON.stringify(result.evidence), "MARKER");
-  }).pipe(Effect.scoped),
+      const run = yield* makeRestrictedChatGptJob(Effect.succeed(credentials)).pipe(
+        Effect.provideService(HttpClient.HttpClient, http),
+      );
+      const jobs = yield* RestrictedTextJobs.RestrictedTextJobs.pipe(
+        Effect.provide(layerJobs(run)),
+      );
+      const client = (
+        scopes: Array<typeof AuthOrchestrationOperateScope | typeof AuthOrchestrationReadScope>,
+      ) =>
+        RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              group.toLayerHandler(WS_METHODS.restrictedTextJob, (input) =>
+                jobs.run(input).pipe(audit.capture),
+              ),
+              RpcAuthorization.layer(scopes),
+            ),
+          ),
+        );
+      const invalid = yield* decodePayload({
+        ...request,
+        serviceTier: "BODY_MARKER",
+      }).pipe(Effect.flip);
+      assert.notInclude(invalid.message, "BODY_MARKER");
+      const denied = yield* client([AuthOrchestrationReadScope]);
+      const denial = yield* denied[WS_METHODS.restrictedTextJob](request).pipe(Effect.flip);
+      assert.strictEqual(denial._tag, "EnvironmentAuthorizationError");
+      assert.strictEqual(requests, 0);
+      const allowed = yield* client([AuthOrchestrationOperateScope]);
+      const result = yield* allowed[WS_METHODS.restrictedTextJob](payload);
+      assert.deepEqual(result.result, { summary });
+      assert.strictEqual(result.evidence.inputBytes, new TextEncoder().encode(input).length);
+      assert.strictEqual(result.evidence.outputBytes, new TextEncoder().encode(output).length);
+      assert.strictEqual(requests, 2);
+      assert.deepEqual(audit.recorded, []);
+      assert.notInclude(JSON.stringify(result.evidence), "MARKER");
+    }).pipe(Effect.scoped),
 );
 
 it.effect(
@@ -206,7 +309,7 @@ it.effect(
         "unsupported_provider",
       );
       assert.strictEqual(
-        (yield* unsupported.run({ ...request, input: "é".repeat(70_000) }).pipe(Effect.flip))
+        (yield* unsupported.run({ ...request, input: "é".repeat(1_048_577) }).pipe(Effect.flip))
           .reason,
         "invalid_input",
       );
@@ -237,6 +340,34 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const cases = [
+        ...[
+          "function_call",
+          "custom_tool_call",
+          "mcp_call",
+          "web_search_call",
+          "computer_call",
+          "future_action",
+        ].map((type) => sse([{ type: "response.output_item.added", item: { type } }, completed])),
+        sse([{ type: "response.refusal.delta", delta: "BODY_MARKER" }, completed]),
+        sse([
+          {
+            type: "response.content_part.added",
+            part: { type: "refusal", refusal: "BODY_MARKER" },
+          },
+          completed,
+        ]),
+        sse([
+          {
+            ...completed,
+            response: {
+              ...completed.response,
+              output: [
+                { type: "reasoning", status: "incomplete", summary: [] },
+                ...completed.response.output,
+              ],
+            },
+          },
+        ]),
         sse([
           {
             type: "response.output_item.added",
@@ -272,14 +403,14 @@ it.effect(
                 {
                   ...completed.response.output[0],
                   content: [
-                    { type: "output_text", text: JSON.stringify({ summary: "x".repeat(66_000) }) },
+                    { type: "output_text", text: JSON.stringify({ summary: "é".repeat(125_000) }) },
                   ],
                 },
               ],
             },
           },
         ]),
-        "x".repeat(1_048_577),
+        "x".repeat(8_388_609),
         "data: BODY_MARKER\n\n",
       ];
       const audit = diagnostics();
