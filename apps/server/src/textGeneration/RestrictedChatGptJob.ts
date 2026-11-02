@@ -54,6 +54,15 @@ const UsageFailure = Schema.Struct({
   }),
 });
 const isUsageFailure = Schema.decodeUnknownEffect(Schema.fromJsonString(UsageFailure));
+const ErrorFields = {
+  code: Schema.optional(Schema.NullOr(Schema.String)),
+  param: Schema.optional(Schema.NullOr(Schema.String)),
+};
+const parseErrorEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({ ...ErrorFields, error: Schema.optional(Schema.Struct(ErrorFields)) }),
+  ),
+);
 const parseEvent = Schema.decodeUnknownEffect(Schema.fromJsonString(Envelope));
 const parseCompletion = Schema.decodeUnknownEffect(Schema.fromJsonString(CompletionEvent));
 const parseOutput = Schema.decodeUnknownEffect(Schema.fromJsonString(OutputEvent));
@@ -102,6 +111,33 @@ const failedResponse = (data: string) =>
     Effect.flatMap((limited) =>
       Effect.fail(new RestrictedTextJobError({ reason: limited ? "usage_limit" : "upstream" })),
     ),
+  );
+// Error codes and parameter names are protocol identifiers; the message may echo request text.
+const errorEvent = (data: string) =>
+  parseErrorEvent(data).pipe(
+    Effect.orElseSucceed(() => ({ code: undefined, param: undefined, error: undefined })),
+    Effect.flatMap(({ code, param, error }) => {
+      const detail = {
+        code: code ?? error?.code ?? "missing",
+        param: param ?? error?.param ?? "missing",
+      };
+      return Effect.logWarning("Restricted text job upstream error").pipe(
+        Effect.annotateLogs(
+          Object.fromEntries(
+            Object.entries(detail).map(([key, value]) => [key, protocolName(value)]),
+          ),
+        ),
+        Effect.andThen(
+          Effect.fail(
+            new RestrictedTextJobError({
+              reason: detail.code.startsWith("subscription_sharing_usage")
+                ? "usage_limit"
+                : "upstream",
+            }),
+          ),
+        ),
+      );
+    }),
   );
 const completedText = (completed: typeof Completed.Type | undefined, model: string) => {
   if (!completed) return rejectOutput("missing-completion");
@@ -184,6 +220,7 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
               Effect.catch(() => rejectOutput("event-envelope")),
             );
             if (type === "response.failed") return yield* failedResponse(event.data);
+            if (type === "error") return yield* errorEvent(event.data);
             if (!allowedEvents.has(type))
               return yield* rejectOutput("event-type", { eventType: type });
             const check = eventChecks.get(type);
