@@ -197,6 +197,8 @@ it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
             ]
           : [];
       const events = [
+        { type: "response.metadata" },
+        { type: "codex.response.metadata" },
         ...reasoningEvents,
         {
           type: "response.output_item.added",
@@ -236,7 +238,15 @@ it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
           assert.deepEqual(body, {
             model: "account-model",
             instructions: request.instructions,
-            input: [{ role: "user", content: [{ type: "input_text", text: input }] }],
+            input: [
+              {
+                role: "user",
+                content: [
+                  { type: "input_text", text: "Respond with a JSON object." },
+                  { type: "input_text", text: input },
+                ],
+              },
+            ],
             tools: [],
             tool_choice: "none",
             store: false,

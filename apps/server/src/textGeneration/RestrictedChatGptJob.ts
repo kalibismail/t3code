@@ -85,6 +85,10 @@ const allowedEvents = new Set([
   "response.reasoning_text.delta",
   "response.reasoning_text.done",
 ]);
+// The subscription stream adds metadata events (response.metadata, codex.*); results only ever
+// come from the strictly decoded completion.
+const ignoredEvent = (type: string) =>
+  type === "response.metadata" || !type.startsWith("response.");
 const protocolName = (value: string) =>
   /^[\w.:/+;= -]{1,100}$/.test(value) ? value : "unrecognised";
 // Names only the failed check and upstream protocol identifiers, never request or response text.
@@ -184,7 +188,11 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
               input: [
                 {
                   role: "user",
-                  content: [{ type: "input_text", text: input.input }],
+                  // json_object mode refuses input that never mentions JSON (param "input").
+                  content: [
+                    { type: "input_text", text: "Respond with a JSON object." },
+                    { type: "input_text", text: input.input },
+                  ],
                 },
               ],
               tools: [],
@@ -221,6 +229,7 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
             );
             if (type === "response.failed") return yield* failedResponse(event.data);
             if (type === "error") return yield* errorEvent(event.data);
+            if (ignoredEvent(type)) return;
             if (!allowedEvents.has(type))
               return yield* rejectOutput("event-type", { eventType: type });
             const check = eventChecks.get(type);
