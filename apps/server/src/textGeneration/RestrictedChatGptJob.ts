@@ -77,7 +77,7 @@ const allowedEvents = new Set([
   "response.reasoning_text.done",
 ]);
 const protocolName = (value: string) =>
-  /^[\w.:/+;= -]{1,400}$/.test(value) ? value : "unrecognised";
+  /^[\w.:/+;= -]{1,100}$/.test(value) ? value : "unrecognised";
 // Names only the failed check and upstream protocol identifiers, never request or response text.
 const rejectOutput = (step: string, detail: Record<string, string> = {}) =>
   Effect.logWarning("Restricted text job rejected upstream output").pipe(
@@ -164,12 +164,6 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
       if (response.status !== 200)
         return yield* new RestrictedTextJobError({
           reason: response.status === 429 ? "usage_limit" : "upstream",
-        });
-      if (!response.headers["content-type"]?.includes("text/event-stream"))
-        return yield* rejectOutput("content-type", {
-          contentType: response.headers["content-type"] ?? "missing",
-          headerNames: Object.keys(response.headers).sort().join(" "),
-          server: response.headers.server ?? "missing",
         });
       let totalBytes = 0;
       let completed: typeof Completed.Type | undefined;

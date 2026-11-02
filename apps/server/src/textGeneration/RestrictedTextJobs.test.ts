@@ -244,10 +244,8 @@ it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
             service_tier: "default",
             text: { format: { type: "json_object" } },
           });
-          return HttpClientResponse.fromWeb(
-            outgoing,
-            new Response(sse(events), { headers: { "content-type": "text/event-stream" } }),
-          );
+          // The subscription route streams without a content-type header.
+          return HttpClientResponse.fromWeb(outgoing, new Response(sse(events)));
         }),
       );
       const run = yield* makeRestrictedChatGptJob(Effect.succeed(credentials)).pipe(
