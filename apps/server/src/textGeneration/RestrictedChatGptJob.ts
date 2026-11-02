@@ -76,23 +76,16 @@ const allowedEvents = new Set([
   "response.reasoning_text.delta",
   "response.reasoning_text.done",
 ]);
-// The subscription backend interleaves its own telemetry (codex.*, responsesapi.*,
-// response.metadata); results only ever come from the strictly decoded completion.
-const ignoredEvent = (type: string) =>
-  type === "response.metadata" || !type.startsWith("response.");
-const protocolName = (value: string) => (/^[\w.:-]{1,80}$/.test(value) ? value : "unrecognised");
+const protocolName = (value: string) =>
+  /^[\w.:/+;= -]{1,100}$/.test(value) ? value : "unrecognised";
 // Names only the failed check and upstream protocol identifiers, never request or response text.
-const rejectOutput = (
-  step: string,
-  detail: { readonly eventType?: string; readonly returnedModel?: string } = {},
-) =>
+const rejectOutput = (step: string, detail: Record<string, string> = {}) =>
   Effect.logWarning("Restricted text job rejected upstream output").pipe(
     Effect.annotateLogs({
       step,
-      ...(detail.eventType === undefined ? {} : { eventType: protocolName(detail.eventType) }),
-      ...(detail.returnedModel === undefined
-        ? {}
-        : { returnedModel: protocolName(detail.returnedModel) }),
+      ...Object.fromEntries(
+        Object.entries(detail).map(([key, value]) => [key, protocolName(value)]),
+      ),
     }),
     Effect.andThen(Effect.fail(new RestrictedTextJobError({ reason: "invalid_output" }))),
   );
@@ -173,7 +166,9 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
           reason: response.status === 429 ? "usage_limit" : "upstream",
         });
       if (!response.headers["content-type"]?.includes("text/event-stream"))
-        return yield* rejectOutput("content-type");
+        return yield* rejectOutput("content-type", {
+          contentType: response.headers["content-type"] ?? "missing",
+        });
       let totalBytes = 0;
       let completed: typeof Completed.Type | undefined;
       yield* response.stream.pipe(
@@ -192,7 +187,6 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
             const { type } = yield* parseEvent(event.data).pipe(
               Effect.catch(() => rejectOutput("event-envelope")),
             );
-            if (ignoredEvent(type)) return;
             if (type === "response.failed") return yield* failedResponse(event.data);
             if (!allowedEvents.has(type))
               return yield* rejectOutput("event-type", { eventType: type });

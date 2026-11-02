@@ -197,10 +197,7 @@ it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
             ]
           : [];
       const events = [
-        { type: "codex.response.metadata" },
-        { type: "response.metadata" },
         ...reasoningEvents,
-        { type: "responsesapi.websocket_timing" },
         {
           type: "response.output_item.added",
           item: { ...message, status: "in_progress", content: [] },
