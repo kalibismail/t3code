@@ -197,7 +197,10 @@ it.effect.each(["small", "full batch", "UTF-8 boundary", "reasoning"] as const)(
             ]
           : [];
       const events = [
+        { type: "codex.response.metadata" },
+        { type: "response.metadata" },
         ...reasoningEvents,
+        { type: "responsesapi.websocket_timing" },
         {
           type: "response.output_item.added",
           item: { ...message, status: "in_progress", content: [] },
@@ -410,6 +413,7 @@ it.effect(
             },
           },
         ]),
+        sse([{ ...completed, response: { ...completed.response, model: "substituted-model" } }]),
         "x".repeat(8_388_609),
         "data: BODY_MARKER\n\n",
       ];
@@ -442,7 +446,7 @@ it.effect(
         assert.notInclude(JSON.stringify(error), "MARKER");
         assert.strictEqual(inference, 1);
         assert.isTrue(signal?.aborted);
-        assert.deepEqual(audit.recorded, []);
+        assert.notInclude(JSON.stringify(audit.recorded), "MARKER");
       }
     }),
 );

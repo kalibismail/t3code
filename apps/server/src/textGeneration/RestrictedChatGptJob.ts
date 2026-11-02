@@ -38,7 +38,9 @@ const OutputEvent = Schema.Struct({
   item: Schema.Struct({ type: Schema.Literals(["message", "reasoning"]) }),
 });
 const ContentEvent = Schema.Struct({
-  part: Schema.Struct({ type: Schema.Literals(["output_text", "reasoning_text"]) }),
+  part: Schema.Struct({
+    type: Schema.Literals(["output_text", "reasoning_text"]),
+  }),
 });
 const CompletionEvent = Schema.Struct({ response: Completed });
 const UsageFailure = Schema.Struct({
@@ -74,6 +76,49 @@ const allowedEvents = new Set([
   "response.reasoning_text.delta",
   "response.reasoning_text.done",
 ]);
+// The subscription backend interleaves its own telemetry (codex.*, responsesapi.*,
+// response.metadata); results only ever come from the strictly decoded completion.
+const ignoredEvent = (type: string) =>
+  type === "response.metadata" || !type.startsWith("response.");
+const protocolName = (value: string) => (/^[\w.:-]{1,80}$/.test(value) ? value : "unrecognised");
+// Names only the failed check and upstream protocol identifiers, never request or response text.
+const rejectOutput = (
+  step: string,
+  detail: { readonly eventType?: string; readonly returnedModel?: string } = {},
+) =>
+  Effect.logWarning("Restricted text job rejected upstream output").pipe(
+    Effect.annotateLogs({
+      step,
+      ...(detail.eventType === undefined ? {} : { eventType: protocolName(detail.eventType) }),
+      ...(detail.returnedModel === undefined
+        ? {}
+        : { returnedModel: protocolName(detail.returnedModel) }),
+    }),
+    Effect.andThen(Effect.fail(new RestrictedTextJobError({ reason: "invalid_output" }))),
+  );
+
+const eventChecks = new Map<string, (data: string) => Effect.Effect<unknown, Schema.SchemaError>>([
+  ["response.output_item.added", parseOutput],
+  ["response.output_item.done", parseOutput],
+  ["response.content_part.added", parseContent],
+  ["response.content_part.done", parseContent],
+]);
+const failedResponse = (data: string) =>
+  isUsageFailure(data).pipe(
+    Effect.match({ onSuccess: () => true, onFailure: () => false }),
+    Effect.flatMap((limited) =>
+      Effect.fail(new RestrictedTextJobError({ reason: limited ? "usage_limit" : "upstream" })),
+    ),
+  );
+const completedText = (completed: typeof Completed.Type | undefined, model: string) => {
+  if (!completed) return rejectOutput("missing-completion");
+  if (completed.model !== model) return rejectOutput("model", { returnedModel: completed.model });
+  return Effect.succeed(
+    completed.output
+      .flatMap((item) => (item.type === "message" ? item.content.map((part) => part.text) : []))
+      .join(""),
+  );
+};
 
 export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(function* (
   access: Effect.Effect<CodexChatGptCredentials, ProviderSetupError>,
@@ -89,13 +134,17 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
         Effect.mapError(() => new RestrictedTextJobError({ reason: "sign_in_required" })),
       );
       if (!credentials.scopes.includes("chatgpt.tokens.use.direct"))
-        return yield* new RestrictedTextJobError({ reason: "sign_in_required" });
+        return yield* new RestrictedTextJobError({
+          reason: "sign_in_required",
+        });
       const models = yield* chatGptModels(credentials.accessToken, []).pipe(
         Effect.provideService(HttpClient.HttpClient, rawHttp),
         Effect.mapError(() => new RestrictedTextJobError({ reason: "model_unavailable" })),
       );
       if (!models.some((model) => model.slug === input.model))
-        return yield* new RestrictedTextJobError({ reason: "model_unavailable" });
+        return yield* new RestrictedTextJobError({
+          reason: "model_unavailable",
+        });
       const response = yield* http
         .execute(
           HttpClientRequest.post("https://api.openai.com/v1/responses").pipe(
@@ -103,7 +152,12 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
             HttpClientRequest.bodyJsonUnsafe({
               model: input.model,
               instructions: input.instructions,
-              input: [{ role: "user", content: [{ type: "input_text", text: input.input }] }],
+              input: [
+                {
+                  role: "user",
+                  content: [{ type: "input_text", text: input.input }],
+                },
+              ],
               tools: [],
               tool_choice: "none",
               store: false,
@@ -119,7 +173,7 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
           reason: response.status === 429 ? "usage_limit" : "upstream",
         });
       if (!response.headers["content-type"]?.includes("text/event-stream"))
-        return yield* new RestrictedTextJobError({ reason: "invalid_output" });
+        return yield* rejectOutput("content-type");
       let totalBytes = 0;
       let completed: typeof Completed.Type | undefined;
       yield* response.stream.pipe(
@@ -134,41 +188,23 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
         Stream.runForEach(
           Effect.fnUntraced(function* (event) {
             if (event.data === "[DONE]" && completed) return;
-            if (completed) return yield* new RestrictedTextJobError({ reason: "invalid_output" });
-            const envelope = yield* parseEvent(event.data).pipe(
-              Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
+            if (completed) return yield* rejectOutput("event-after-completion");
+            const { type } = yield* parseEvent(event.data).pipe(
+              Effect.catch(() => rejectOutput("event-envelope")),
             );
-            if (envelope.type === "response.failed") {
-              const limited = yield* isUsageFailure(event.data).pipe(
-                Effect.match({ onSuccess: () => true, onFailure: () => false }),
+            if (ignoredEvent(type)) return;
+            if (type === "response.failed") return yield* failedResponse(event.data);
+            if (!allowedEvents.has(type))
+              return yield* rejectOutput("event-type", { eventType: type });
+            const check = eventChecks.get(type);
+            if (check)
+              yield* check(event.data).pipe(
+                Effect.catch(() => rejectOutput("event-shape", { eventType: type })),
               );
-              return yield* new RestrictedTextJobError({
-                reason: limited ? "usage_limit" : "upstream",
-              });
-            }
-            if (!allowedEvents.has(envelope.type))
-              return yield* new RestrictedTextJobError({ reason: "invalid_output" });
-            if (
-              envelope.type === "response.output_item.added" ||
-              envelope.type === "response.output_item.done"
-            ) {
-              yield* parseOutput(event.data).pipe(
-                Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
-              );
-            }
-            if (
-              envelope.type === "response.content_part.added" ||
-              envelope.type === "response.content_part.done"
-            ) {
-              yield* parseContent(event.data).pipe(
-                Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
-              );
-            }
-            if (envelope.type === "response.completed") {
+            if (type === "response.completed")
               completed = (yield* parseCompletion(event.data).pipe(
-                Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
+                Effect.catch(() => rejectOutput("completion")),
               )).response;
-            }
           }),
         ),
         Effect.mapError((error) =>
@@ -177,17 +213,11 @@ export const makeRestrictedChatGptJob = Effect.fn("makeRestrictedChatGptJob")(fu
             : new RestrictedTextJobError({ reason: "upstream" }),
         ),
       );
-      if (!completed || completed.model !== input.model)
-        return yield* new RestrictedTextJobError({ reason: "invalid_output" });
-      const output = completed.output
-        .flatMap((item) => (item.type === "message" ? item.content.map((part) => part.text) : []))
-        .join("");
+      const output = yield* completedText(completed, input.model);
       const outputBytes = new TextEncoder().encode(output).length;
       if (outputBytes > 250_000)
         return yield* new RestrictedTextJobError({ reason: "output_limit" });
-      const result = yield* parseResult(output).pipe(
-        Effect.mapError(() => new RestrictedTextJobError({ reason: "invalid_output" })),
-      );
+      const result = yield* parseResult(output).pipe(Effect.catch(() => rejectOutput("result")));
       return {
         result,
         evidence: {
